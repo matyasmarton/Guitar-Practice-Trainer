@@ -26,7 +26,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use scopeguard::defer;
-use tui_big_text::{BigText, PixelSize};
 
 use guitar_trainer_core::audio;
 use guitar_trainer_core::challenges::ChallengeType;
@@ -851,70 +850,90 @@ fn draw_menu(
     f.render_widget(footer, chunks[2]);
 }
 
-/// Ordered checklist / set-completion line under the hero prompt (e.g.
-/// `[2/3]  E → G# → B` or `2  [✓E] [  G#] [  B]`), shared by every place
-/// that renders it.
-fn build_targets_line(ui: &UiState, success_style: Style) -> Line<'static> {
-    if ui.ordered {
-        let mut spans = vec![Span::raw(format!("[{}/{}]  ", ui.matched, ui.targets.len()))];
-        for (i, t) in ui.targets.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" → "));
-            }
-            if ui.matched_indices.get(i).copied().unwrap_or(false) {
-                spans.push(Span::styled(t.clone(), success_style));
-            } else {
-                spans.push(Span::raw(t.clone()));
-            }
+/// Vertically centers a `content_h`-row block within `rect`, leaving any
+/// leftover space split evenly above and below. Used to keep the target
+/// chips comfortably framed instead of stretching to fill a tall panel.
+fn center_v(rect: Rect, content_h: u16) -> Rect {
+    if rect.height <= content_h {
+        return rect;
+    }
+    let pad = (rect.height - content_h) / 2;
+    Rect { x: rect.x, y: rect.y + pad, width: rect.width, height: content_h }
+}
+
+/// The notes to actually play — the single most important piece of
+/// information during practice, and the hero panel's largest, boldest
+/// element (the prompt name above it is de-emphasized context by
+/// comparison). Each target is its own bordered chip: a green border plus
+/// leading checkmark once matched, a plain border otherwise. Ordered
+/// prompts chain the chips with a plain arrow so the required sequence
+/// reads left to right; unordered prompts space them evenly with no
+/// implied order.
+fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let success = Style::default().fg(parse_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
+    let idle_border = Style::default().fg(parse_color(&theme.secondary, Color::Cyan));
+    let idle_text = Style::default().add_modifier(Modifier::BOLD);
+
+    let box_w = ui.targets.iter().map(|t| t.chars().count() as u16).max().unwrap_or(1) + 6;
+    let box_h = area.height.min(5).max(3);
+    let gap_w: u16 = if ui.ordered { 5 } else { 3 };
+    let n = ui.targets.len() as u16;
+    let content_w = (box_w * n + gap_w * n.saturating_sub(1)).min(area.width);
+
+    let row = center_v(area, box_h);
+    let outer = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Length(content_w), Constraint::Fill(1)])
+        .split(row);
+
+    let mut cell_constraints = Vec::with_capacity(ui.targets.len() * 2);
+    for i in 0..ui.targets.len() {
+        if i > 0 {
+            cell_constraints.push(Constraint::Length(gap_w));
         }
-        Line::from(spans)
-    } else {
-        let mut spans = vec![Span::raw(format!("{}  ", ui.matched))];
-        for (i, t) in ui.targets.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" "));
+        cell_constraints.push(Constraint::Length(box_w));
+    }
+    let cells = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(cell_constraints)
+        .split(outer[1]);
+
+    let mut ci = 0usize;
+    for (i, t) in ui.targets.iter().enumerate() {
+        if i > 0 {
+            if ui.ordered {
+                f.render_widget(
+                    Paragraph::new("→").alignment(Alignment::Center).style(idle_border),
+                    center_v(cells[ci], 1),
+                );
             }
-            if ui.matched_indices.get(i).copied().unwrap_or(false) {
-                spans.push(Span::styled(format!("[✓{}]", t), success_style));
-            } else {
-                spans.push(Span::raw(format!("[  {}]", t)));
-            }
+            ci += 1;
         }
-        Line::from(spans)
+        let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
+        let rect = cells[ci];
+        ci += 1;
+        let (border_style, text_style, label) = if matched {
+            (success, success, format!("✓ {t}"))
+        } else {
+            (idle_border, idle_text, t.clone())
+        };
+        let chip = Block::default().borders(Borders::ALL).border_style(border_style);
+        let chip_inner = chip.inner(rect);
+        f.render_widget(chip, rect);
+        f.render_widget(
+            Paragraph::new(label).alignment(Alignment::Center).style(text_style),
+            center_v(chip_inner, 1),
+        );
     }
 }
 
-/// How the current prompt name is rendered inside the hero panel: real
-/// big-glyph text (`tui-big-text`) when it fits the panel without
-/// truncation, otherwise a bold fallback with generous padding. Chosen per
-/// frame from the actual prompt string and the actual panel size — never
-/// forces oversized text into a column too narrow for it.
-enum PromptGlyph {
-    Big(PixelSize, u16),
-    Plain,
-}
-
-fn choose_prompt_glyph(text: &str, avail_w: u16, avail_h: u16) -> PromptGlyph {
-    let len = text.chars().count() as u16;
-    if len == 0 || avail_w == 0 {
-        return PromptGlyph::Plain;
-    }
-    // (pixel size, glyph cell width, glyph cell height); widest/tallest
-    // tier tried first. Reserve room below the glyph for a gap + the
-    // (possibly two-line) targets checklist.
-    const RESERVED_ROWS: u16 = 3;
-    let tiers: [(PixelSize, u16, u16); 2] = [(PixelSize::Full, 8, 8), (PixelSize::Quadrant, 4, 4)];
-    for (size, cw, ch) in tiers {
-        if len.saturating_mul(cw) <= avail_w && ch + RESERVED_ROWS <= avail_h {
-            return PromptGlyph::Big(size, ch);
-        }
-    }
-    PromptGlyph::Plain
-}
-
-/// Renders the current-prompt hero panel: kind title, a large legible
-/// rendering of the prompt name, and the target checklist below it.
-/// `area` is the whole panel including its border.
+/// Renders the current-prompt hero panel: kind title (small, in the
+/// border), the prompt name (secondary emphasis — context, not the task),
+/// and the target notes to actually play (the panel's dominant element —
+/// this is what needs to read clearly from playing distance).
 fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", ui.prompt_kind),
@@ -923,60 +942,50 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
-    let targets = build_targets_line(ui, success_style);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(6),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
 
-    let prompt_text = ui.prompt_display.trim();
-    let h_pad = inner.width.min(4);
-    let glyph = choose_prompt_glyph(prompt_text, inner.width.saturating_sub(h_pad), inner.height);
+    // Prompt name: what you're playing, shown small and unobtrusive — it's
+    // context, not the actionable content. Letter-spaced plain text instead
+    // of block-glyph ASCII art so it stays legible without visual noise;
+    // falls back to unspaced text rather than clip if the spacing wouldn't
+    // fit the panel.
+    let name = ui.prompt_display.trim();
+    let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+    let name_text = if spaced.chars().count() as u16 <= inner.width {
+        spaced
+    } else {
+        name.to_string()
+    };
+    f.render_widget(
+        Paragraph::new(name_text)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan))),
+        layout[1],
+    );
 
-    match glyph {
-        PromptGlyph::Big(size, rows) => {
-            let layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Fill(1),
-                    Constraint::Length(rows),
-                    Constraint::Length(1),
-                    Constraint::Length(2),
-                    Constraint::Fill(1),
-                ])
-                .split(inner);
-            let big = BigText::builder()
-                .pixel_size(size)
-                .style(Style::default())
-                .centered()
-                .lines(vec![Line::from(prompt_text)])
-                .build();
-            f.render_widget(big, layout[1]);
-            f.render_widget(
-                Paragraph::new(targets).alignment(Alignment::Center).wrap(Wrap { trim: true }),
-                layout[3],
-            );
-        }
-        PromptGlyph::Plain => {
-            let layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Fill(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(2),
-                    Constraint::Fill(1),
-                ])
-                .split(inner);
-            f.render_widget(
-                Paragraph::new(prompt_text)
-                    .alignment(Alignment::Center)
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-                layout[1],
-            );
-            f.render_widget(
-                Paragraph::new(targets).alignment(Alignment::Center).wrap(Wrap { trim: true }),
-                layout[3],
-            );
-        }
-    }
+    let caption = if ui.ordered {
+        format!("{} OF {} MATCHED — IN ORDER", ui.matched, ui.targets.len())
+    } else {
+        format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
+    };
+    f.render_widget(
+        Paragraph::new(caption)
+            .alignment(Alignment::Center)
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        layout[3],
+    );
+
+    render_targets_row(f, layout[4], ui, theme);
 }
 
 /// Where the Session panel (or its collapsed fallback) lands on the
@@ -1100,16 +1109,22 @@ fn draw_practice(
         detected_rows[1],
     );
 
-    // Footer action bar: Stop / Skip / Settings, current one highlighted.
+    // Footer action bar: Stop / Skip / Settings. The highlighted action
+    // gets a filled background pill plus a "‣ " marker and underline (the
+    // same marker the vertical menus use) so the current selection is
+    // unmistakable at a glance, not just a subtle color shift.
     let mut spans = Vec::new();
     for (i, label) in PRACTICE_ACTIONS.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw("    "));
+            spans.push(Span::raw("     "));
         }
         if i == app.practice_idx {
-            spans.push(Span::styled(format!(" {label} "), selection_style(theme)));
+            spans.push(Span::styled(
+                format!(" ‣ {label} "),
+                selection_style(theme).add_modifier(Modifier::UNDERLINED),
+            ));
         } else {
-            spans.push(Span::raw(format!(" {label} ")));
+            spans.push(Span::raw(format!("   {label} ")));
         }
     }
     let footer = Paragraph::new(Line::from(spans))
