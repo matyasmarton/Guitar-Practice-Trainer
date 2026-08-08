@@ -23,7 +23,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use tui_big_text::{BigText, PixelSize};
 use ratatui::Terminal;
 use scopeguard::defer;
 
@@ -174,6 +175,12 @@ fn drain_device_scan(app: &mut App) {
 fn main() -> Result<()> {
     // Terminal setup.
     enable_raw_mode()?;
+    // This app is a full-screen TUI whose color carries semantics (yellow
+    // selection, green matches, red warnings); it is not a plain stdout
+    // program, so it opts out of the NO_COLOR convention that crossterm
+    // honors by default. Without this, a NO_COLOR env var (even one set by
+    // a shell wrapper) silently strips every color from the whole UI.
+    crossterm::style::Colored::set_ansi_color_disabled(false);
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     defer! {
@@ -629,10 +636,35 @@ fn parse_color(hex: &str, fallback: Color) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// True if the terminal advertises 24-bit color (`COLORTERM=truecolor` /
+/// `24bit`). macOS Terminal.app and other 256-color terminals omit this;
+/// ratatui 0.28 has no capability probe, so the env check is the standard
+/// heuristic (the one used by crossterm's own `supports_color` era, tmux,
+/// and most CLI tools).
+fn truecolor_terminal() -> bool {
+    std::env::var("COLORTERM")
+        .map(|v| v.contains("truecolor") || v.contains("24bit"))
+        .unwrap_or(false)
+}
+
+/// Theme hex → ratatui `Color`. On truecolor terminals the exact hex value
+/// is used; everywhere else the caller's *named* `fallback` is used instead
+/// — named ANSI colors (Cyan/Yellow/Green/…) render in every terminal,
+/// where raw `38;2` RGB sequences silently fall back to default on
+/// non-truecolor emulators. Without this, a missing `COLORTERM` blanks all
+/// theme color at once.
+fn theme_color(hex: &str, fallback: Color) -> Color {
+    if truecolor_terminal() {
+        parse_color(hex, fallback)
+    } else {
+        fallback
+    }
+}
+
 fn selection_style(theme: &Theme) -> Style {
     Style::default()
-        .fg(parse_color(&theme.selection_fg, Color::Black))
-        .bg(parse_color(&theme.selection_bg, Color::Yellow))
+        .fg(theme_color(&theme.selection_fg, Color::Black))
+        .bg(theme_color(&theme.selection_bg, Color::Yellow))
         .add_modifier(Modifier::BOLD)
 }
 
@@ -679,7 +711,7 @@ fn session_summary_lines(ui: &UiState, settings: &SettingsState, theme: &Theme) 
         .clone()
         .unwrap_or_else(|| "(default mic)".to_string());
     let label_style = Style::default().fg(Color::DarkGray);
-    let value_style = Style::default().fg(parse_color(&theme.secondary, Color::Cyan));
+    let value_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
     vec![
         Line::from(vec![
             Span::styled("Score      ", label_style),
@@ -712,7 +744,8 @@ fn render_session_panel(
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
         .title(" Session ");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -737,8 +770,8 @@ fn render_session_panel(
         rows[1],
     );
 
-    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
-    let danger_style = Style::default().fg(parse_color(&theme.danger, Color::Red));
+    let success_style = Style::default().fg(theme_color(&theme.success, Color::Green));
+    let danger_style = Style::default().fg(theme_color(&theme.danger, Color::Red));
     if ui.history.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled(
@@ -841,10 +874,10 @@ fn draw_menu(
         .clone()
         .unwrap_or_else(|| "(default mic)".to_string());
     let (footer_text, footer_style) = match &ui.status {
-        Some(msg) => (msg.clone(), Style::default().fg(parse_color(&theme.danger, Color::Red))),
+        Some(msg) => (msg.clone(), Style::default().fg(theme_color(&theme.danger, Color::Red))),
         None => (
             format!("mic: {device_name}   ✓{}/{}", ui.score_passed, ui.score_total),
-            Style::default().fg(parse_color(&theme.secondary, Color::Cyan)),
+            Style::default().fg(theme_color(&theme.secondary, Color::Cyan)),
         ),
     };
     let footer = Paragraph::new(footer_text)
@@ -866,50 +899,53 @@ fn center_v(rect: Rect, content_h: u16) -> Rect {
 
 /// The notes to actually play — the single most important piece of
 /// information during practice, and the hero panel's largest, boldest
-/// element. Each target is its own bordered chip, letter-spaced to read
-/// large from playing distance (matching the prompt name's treatment)
-/// whenever the row has room for it; a green border plus leading
-/// checkmark once matched, a plain accent border otherwise. Ordered
-/// prompts chain the chips with a plain arrow so the required sequence
-/// reads left to right; unordered prompts space them evenly with no
-/// implied order.
+/// element. Each target is its own rounded bordered chip; the label renders
+/// as block-glyph big text (4 rows tall per note, ~4× the old single line)
+/// so it reads from playing distance — cyan border + cyan glyphs, turning
+/// green once matched. Ordered prompts chain the chips with an arrow so the
+/// required sequence reads left to right; unordered prompts space them
+/// evenly. If the big-text row would not fit the panel width (narrow
+/// terminal), it falls back to plain bold labels rather than clip.
 fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
-    let success = Style::default().fg(parse_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
-    let idle_border = Style::default().fg(parse_color(&theme.secondary, Color::Cyan));
-    let idle_text = Style::default().add_modifier(Modifier::BOLD);
+    let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
+    let idle_border = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
+    let idle_text = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
+    let plain_text = Style::default().add_modifier(Modifier::BOLD);
 
-    let spaced = |s: &str| s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
     let gap_w: u16 = if ui.ordered { 5 } else { 3 };
     let n = ui.targets.len() as u16;
-    // Wider than before (was +6) so the enlarged, letter-spaced label still
-    // sits inside a comfortably padded chip.
-    let pad: u16 = 8;
+    // Quadrant pixel size renders each source character 4 cells wide and 4
+    // rows tall — big enough to fill the 9-row chip, small enough to keep
+    // the box at its previous size.
+    const BIG_COLS: u16 = 4;
+    const BIG_ROWS: u16 = 4;
+    let inner_h = area.height.saturating_sub(2);
 
-    // Prefer letter-spaced labels ("C 5") — larger and easier to read at a
-    // glance, matching the prompt name's treatment — but only if the whole
-    // row still fits the panel; otherwise fall back to tight labels rather
-    // than clip or wrap.
-    let spaced_box_w = ui.targets.iter().map(|t| spaced(t).chars().count() as u16 + pad).max().unwrap_or(1);
-    let spaced_content_w = spaced_box_w * n + gap_w * n.saturating_sub(1);
-    let use_spacing = spaced_content_w <= area.width;
+    // Big-text chips are preferred, but only when every chip fits the row;
+    // otherwise fall back to plain bold labels rather than clip or wrap.
+    let big_box_w = ui
+        .targets
+        .iter()
+        .map(|t| t.chars().count() as u16 * BIG_COLS + 6) // glyphs + borders + 2-col slack
+        .max()
+        .unwrap_or(1);
+    let big_content_w = big_box_w * n + gap_w * n.saturating_sub(1);
+    let use_big = inner_h >= BIG_ROWS && big_content_w <= area.width;
 
-    let box_w = if use_spacing {
-        spaced_box_w
+    let box_w = if use_big {
+        big_box_w
     } else {
-        ui.targets.iter().map(|t| t.chars().count() as u16 + pad).max().unwrap_or(1)
+        ui.targets.iter().map(|t| t.chars().count() as u16 + 6).max().unwrap_or(1)
     };
     let content_w = (box_w * n + gap_w * n.saturating_sub(1)).min(area.width);
 
-    // `area` arrives already sized to the intended chip height by the
-    // caller (`render_hero_prompt`), so no re-centering is needed here.
-    let row = area;
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Fill(1), Constraint::Length(content_w), Constraint::Fill(1)])
-        .split(row);
+        .split(area);
 
     let mut cell_constraints = Vec::with_capacity(ui.targets.len() * 2);
     for i in 0..ui.targets.len() {
@@ -937,19 +973,34 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
         let rect = cells[ci];
         ci += 1;
-        let label_core = if use_spacing { spaced(t) } else { t.clone() };
-        let (border_style, text_style, label) = if matched {
-            (success, success, format!("✓ {label_core}"))
+        let (border_style, text_style) = if matched {
+            (success, success)
         } else {
-            (idle_border, idle_text, label_core)
+            (idle_border, idle_text)
         };
-        let chip = Block::default().borders(Borders::ALL).border_style(border_style);
+        let chip = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border_style);
         let chip_inner = chip.inner(rect);
         f.render_widget(chip, rect);
-        f.render_widget(
-            Paragraph::new(label).alignment(Alignment::Center).style(text_style),
-            center_v(chip_inner, 1),
-        );
+        if use_big {
+            let big = BigText::builder()
+                .pixel_size(PixelSize::Quadrant)
+                .style(text_style)
+                .centered()
+                .lines(vec![Line::from(t.clone())])
+                .build();
+            f.render_widget(big, center_v(chip_inner, BIG_ROWS));
+        } else {
+            // Plain fallback keeps the leading checkmark for matched notes
+            // (the ✓ glyph isn't in the 8x8 pixel font big text uses).
+            let label = if matched { format!("✓ {t}") } else { t.clone() };
+            f.render_widget(
+                Paragraph::new(label).alignment(Alignment::Center).style(plain_text),
+                center_v(chip_inner, 1),
+            );
+        }
     }
 }
 
@@ -963,7 +1014,8 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
 fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
         .title(Span::styled(
             format!(" {} ", ui.prompt_kind),
             Style::default().add_modifier(Modifier::BOLD),
@@ -974,13 +1026,15 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     // Size the chip row first so the name + caption + chips group can be
     // measured as a single block and centered together, rather than
     // pinning the name to the top and centering the chips separately in
-    // whatever space is left over.
-    let name_h: u16 = 1;
+    // whatever space is left over. The name and caption each take 2 rows
+    // (up from 1) and the gap above the chips grows 2→4 rows, so the
+    // heading cluster reads clearly above the notes — which keep their
+    // previous 9-row cap.
+    let name_h: u16 = 2;
     let gap_above_caption: u16 = 1;
-    let caption_h: u16 = 1;
-    let gap_above_chips: u16 = 2;
+    let caption_h: u16 = 2;
+    let gap_above_chips: u16 = 4;
     let fixed_h = name_h + gap_above_caption + caption_h + gap_above_chips;
-    // Chip row is taller than before (cap was 5) so the notes read larger.
     let box_h = inner.height.saturating_sub(fixed_h).clamp(5, 9);
     let content_h = fixed_h + box_h;
 
@@ -996,10 +1050,10 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         ])
         .split(group);
 
-    // Prompt name: context above the actionable notes, bold and
-    // letter-spaced so it still reads clearly at a glance rather than
-    // hugging the top of the panel. Falls back to unspaced text rather
-    // than clip if the spacing wouldn't fit the panel.
+    // Prompt name: the heading. Accent yellow — the first colored thing the
+    // eye lands on — bold, letter-spaced, vertically centered in its 2-row
+    // band so it reads as a distinct title above the notes. Falls back to
+    // unspaced text rather than clip if the spacing wouldn't fit the panel.
     let name = ui.prompt_display.trim();
     let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
     let name_text = if spaced.chars().count() as u16 <= inner.width {
@@ -1010,10 +1064,10 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     f.render_widget(
         Paragraph::new(name_text).alignment(Alignment::Center).style(
             Style::default()
-                .fg(parse_color(&theme.secondary, Color::Cyan))
+                .fg(theme_color(&theme.accent, Color::Yellow))
                 .add_modifier(Modifier::BOLD),
         ),
-        layout[0],
+        center_v(layout[0], 1),
     );
 
     let caption = if ui.ordered {
@@ -1021,16 +1075,16 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     } else {
         format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
     };
-    // A little colour once progress starts, instead of a flat white line
-    // the whole time.
+    // The subheading: cyan by default, switching to green once progress
+    // starts — never a flat white line.
     let caption_style = if ui.matched > 0 {
-        Style::default().fg(parse_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().add_modifier(Modifier::BOLD)
+        Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
     };
     f.render_widget(
         Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
-        layout[2],
+        center_v(layout[2], 1),
     );
 
     render_targets_row(f, layout[4], ui, theme);
@@ -1103,16 +1157,17 @@ fn draw_practice(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(timer_area);
-    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
+    let success_style = Style::default().fg(theme_color(&theme.success, Color::Green));
 
     let gauge_color = if ui.time_left_secs <= 5 {
-        parse_color(&theme.danger, Color::Red)
+        theme_color(&theme.danger, Color::Red)
     } else {
-        parse_color(&theme.success, Color::Green)
+        theme_color(&theme.success, Color::Green)
     };
     let timer_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
         .title(" Timer ");
     let timer_inner = timer_block.inner(mid[0]);
     f.render_widget(timer_block, mid[0]);
@@ -1133,7 +1188,7 @@ fn draw_practice(
     // During the post-match cooldown, blink the Detected panel (alternating
     // reversed/success and plain accent styles every 200ms) as an obvious
     // "matched, hold on" cue; otherwise render with the plain accent style.
-    let accent_style = Style::default().fg(parse_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
+    let accent_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
     let cooldown_active = ui
         .cooldown_started
         .map(|t| t.elapsed() < Duration::from_millis(ui.cooldown_ms))
@@ -1150,7 +1205,8 @@ fn draw_practice(
     };
     let detected_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
         .title(" Detected ");
     let detected_inner = detected_block.inner(mid[1]);
     f.render_widget(detected_block, mid[1]);
@@ -1186,6 +1242,8 @@ fn draw_practice(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
                 .title(" ←→ select, Enter to activate "),
         );
     f.render_widget(footer, action_area);
@@ -1202,7 +1260,7 @@ fn draw_practice(
                 ui.score_passed, ui.score_total, device_name
             ))
             .alignment(Alignment::Center)
-            .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)));
+            .style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)));
             f.render_widget(line, rect);
         }
     }
@@ -1294,7 +1352,7 @@ fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, setti
     let p = Paragraph::new(body)
         .block(block)
         .wrap(Wrap { trim: true })
-        .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)));
+        .style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)));
     f.render_widget(p, area);
 }
 
