@@ -710,7 +710,10 @@ fn render_session_panel(
     theme: &Theme,
     show_categories: bool,
 ) {
-    let block = Block::default().borders(Borders::ALL).title(" Session ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .title(" Session ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -863,9 +866,10 @@ fn center_v(rect: Rect, content_h: u16) -> Rect {
 
 /// The notes to actually play — the single most important piece of
 /// information during practice, and the hero panel's largest, boldest
-/// element (the prompt name above it is de-emphasized context by
-/// comparison). Each target is its own bordered chip: a green border plus
-/// leading checkmark once matched, a plain border otherwise. Ordered
+/// element. Each target is its own bordered chip, letter-spaced to read
+/// large from playing distance (matching the prompt name's treatment)
+/// whenever the row has room for it; a green border plus leading
+/// checkmark once matched, a plain accent border otherwise. Ordered
 /// prompts chain the chips with a plain arrow so the required sequence
 /// reads left to right; unordered prompts space them evenly with no
 /// implied order.
@@ -877,13 +881,31 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let idle_border = Style::default().fg(parse_color(&theme.secondary, Color::Cyan));
     let idle_text = Style::default().add_modifier(Modifier::BOLD);
 
-    let box_w = ui.targets.iter().map(|t| t.chars().count() as u16).max().unwrap_or(1) + 6;
-    let box_h = area.height.min(5).max(3);
+    let spaced = |s: &str| s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
     let gap_w: u16 = if ui.ordered { 5 } else { 3 };
     let n = ui.targets.len() as u16;
+    // Wider than before (was +6) so the enlarged, letter-spaced label still
+    // sits inside a comfortably padded chip.
+    let pad: u16 = 8;
+
+    // Prefer letter-spaced labels ("C 5") — larger and easier to read at a
+    // glance, matching the prompt name's treatment — but only if the whole
+    // row still fits the panel; otherwise fall back to tight labels rather
+    // than clip or wrap.
+    let spaced_box_w = ui.targets.iter().map(|t| spaced(t).chars().count() as u16 + pad).max().unwrap_or(1);
+    let spaced_content_w = spaced_box_w * n + gap_w * n.saturating_sub(1);
+    let use_spacing = spaced_content_w <= area.width;
+
+    let box_w = if use_spacing {
+        spaced_box_w
+    } else {
+        ui.targets.iter().map(|t| t.chars().count() as u16 + pad).max().unwrap_or(1)
+    };
     let content_w = (box_w * n + gap_w * n.saturating_sub(1)).min(area.width);
 
-    let row = center_v(area, box_h);
+    // `area` arrives already sized to the intended chip height by the
+    // caller (`render_hero_prompt`), so no re-centering is needed here.
+    let row = area;
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Fill(1), Constraint::Length(content_w), Constraint::Fill(1)])
@@ -915,10 +937,11 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
         let rect = cells[ci];
         ci += 1;
+        let label_core = if use_spacing { spaced(t) } else { t.clone() };
         let (border_style, text_style, label) = if matched {
-            (success, success, format!("✓ {t}"))
+            (success, success, format!("✓ {label_core}"))
         } else {
-            (idle_border, idle_text, t.clone())
+            (idle_border, idle_text, label_core)
         };
         let chip = Block::default().borders(Borders::ALL).border_style(border_style);
         let chip_inner = chip.inner(rect);
@@ -931,34 +954,52 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
 }
 
 /// Renders the current-prompt hero panel: kind title (small, in the
-/// border), the prompt name (secondary emphasis — context, not the task),
-/// and the target notes to actually play (the panel's dominant element —
-/// this is what needs to read clearly from playing distance).
+/// border), then the prompt name, match caption, and target-note chips
+/// grouped into one tightly-spaced block and centered together in the
+/// panel — keeping the name and the notes to play visually adjacent
+/// instead of pinning the name near the top with the chips centered far
+/// below it. The target notes remain the panel's largest, boldest
+/// element: this is what needs to read clearly from playing distance.
 fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        format!(" {} ", ui.prompt_kind),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .title(Span::styled(
+            format!(" {} ", ui.prompt_kind),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Size the chip row first so the name + caption + chips group can be
+    // measured as a single block and centered together, rather than
+    // pinning the name to the top and centering the chips separately in
+    // whatever space is left over.
+    let name_h: u16 = 1;
+    let gap_above_caption: u16 = 1;
+    let caption_h: u16 = 1;
+    let gap_above_chips: u16 = 2;
+    let fixed_h = name_h + gap_above_caption + caption_h + gap_above_chips;
+    // Chip row is taller than before (cap was 5) so the notes read larger.
+    let box_h = inner.height.saturating_sub(fixed_h).clamp(5, 9);
+    let content_h = fixed_h + box_h;
+
+    let group = center_v(inner, content_h);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Fill(6),
-            Constraint::Fill(1),
+            Constraint::Length(name_h),
+            Constraint::Length(gap_above_caption),
+            Constraint::Length(caption_h),
+            Constraint::Length(gap_above_chips),
+            Constraint::Length(box_h),
         ])
-        .split(inner);
+        .split(group);
 
-    // Prompt name: what you're playing, shown small and unobtrusive — it's
-    // context, not the actionable content. Letter-spaced plain text instead
-    // of block-glyph ASCII art so it stays legible without visual noise;
-    // falls back to unspaced text rather than clip if the spacing wouldn't
-    // fit the panel.
+    // Prompt name: context above the actionable notes, bold and
+    // letter-spaced so it still reads clearly at a glance rather than
+    // hugging the top of the panel. Falls back to unspaced text rather
+    // than clip if the spacing wouldn't fit the panel.
     let name = ui.prompt_display.trim();
     let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
     let name_text = if spaced.chars().count() as u16 <= inner.width {
@@ -967,10 +1008,12 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         name.to_string()
     };
     f.render_widget(
-        Paragraph::new(name_text)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan))),
-        layout[1],
+        Paragraph::new(name_text).alignment(Alignment::Center).style(
+            Style::default()
+                .fg(parse_color(&theme.secondary, Color::Cyan))
+                .add_modifier(Modifier::BOLD),
+        ),
+        layout[0],
     );
 
     let caption = if ui.ordered {
@@ -978,11 +1021,16 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     } else {
         format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
     };
+    // A little colour once progress starts, instead of a flat white line
+    // the whole time.
+    let caption_style = if ui.matched > 0 {
+        Style::default().fg(parse_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
     f.render_widget(
-        Paragraph::new(caption)
-            .alignment(Alignment::Center)
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-        layout[3],
+        Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
+        layout[2],
     );
 
     render_targets_row(f, layout[4], ui, theme);
@@ -1062,7 +1110,10 @@ fn draw_practice(
     } else {
         parse_color(&theme.success, Color::Green)
     };
-    let timer_block = Block::default().borders(Borders::ALL).title(" Timer ");
+    let timer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .title(" Timer ");
     let timer_inner = timer_block.inner(mid[0]);
     f.render_widget(timer_block, mid[0]);
     let timer_rows = Layout::default()
@@ -1097,7 +1148,10 @@ fn draw_practice(
     } else {
         accent_style
     };
-    let detected_block = Block::default().borders(Borders::ALL).title(" Detected ");
+    let detected_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)))
+        .title(" Detected ");
     let detected_inner = detected_block.inner(mid[1]);
     f.render_widget(detected_block, mid[1]);
     let detected_rows = Layout::default()
