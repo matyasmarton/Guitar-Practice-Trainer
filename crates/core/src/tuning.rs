@@ -6,6 +6,8 @@
 //! the G and B strings. Movable chord/scale shapes only hold across every
 //! root for the all-fourths tunings.
 
+use std::ops::RangeInclusive;
+
 use serde::{Deserialize, Serialize};
 
 use crate::note::{Note, MIDI_MAX};
@@ -28,6 +30,19 @@ impl TuningId {
             TuningId::AllFourths => [40, 45, 50, 55, 60, 65],      // E2 A2 D3 G3 C4 F4
             TuningId::DropDAllFourths => [38, 43, 48, 53, 58, 63], // D2 G2 C3 F3 A#3 D#4
         }
+    }
+
+    /// Inclusive MIDI range playable on this tuning: from the open low
+    /// string up to the highest string fretted to [`FRET_COUNT`]. Adjacent
+    /// strings are always ≤5 semitones apart (a perfect fourth, or the
+    /// major third on `Standard`), which is less than `FRET_COUNT`, so each
+    /// string's own reachable span overlaps the next and their union has no
+    /// gaps — every MIDI value in this range is reachable on *some* string.
+    pub fn range(self) -> RangeInclusive<u8> {
+        let strings = self.open_strings();
+        let lo = strings[0];
+        let hi = strings[strings.len() - 1].saturating_add(FRET_COUNT);
+        lo..=hi
     }
 
     /// Human-readable label; also the FFI/UI wire string (mirrors `ChallengeType::label`).
@@ -100,5 +115,28 @@ mod tests {
         assert_eq!(string_midi(TuningId::AllFourths, 5, 22), Some(87));
         assert!(string_midi(TuningId::AllFourths, 6, 0).is_none());
         assert!(string_midi(TuningId::AllFourths, 5, 25).is_none());
+    }
+
+    #[test]
+    fn range_matches_open_low_to_fretted_high() {
+        assert_eq!(TuningId::Standard.range(), 40..=86);
+        assert_eq!(TuningId::AllFourths.range(), 40..=87);
+        assert_eq!(TuningId::DropDAllFourths.range(), 38..=85);
+    }
+
+    #[test]
+    fn range_has_no_unreachable_gaps() {
+        // Every MIDI value the generators might pick from `range()` must be
+        // reachable on at least one string — otherwise a "playable" pick
+        // could still be an impossible fretting for the active tuning.
+        for tuning in TuningId::ALL {
+            for midi in tuning.range() {
+                assert!(
+                    (0..6).any(|s| string_midi(tuning, s, 0)
+                        .map_or(false, |open| midi >= open && midi - open <= FRET_COUNT)),
+                    "{tuning:?} MIDI {midi} in range() but not reachable on any string"
+                );
+            }
+        }
     }
 }

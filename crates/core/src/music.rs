@@ -187,26 +187,32 @@ impl Mode {
 // Fretted voicing generation
 // ---------------------------------------------------------------------------
 
-/// Chord voicing: place each chord tone on the **next higher string**, raising
-/// the target by octaves until it lands within that string's fret range.
+/// Chord voicing: place each chord tone on the **next higher string starting
+/// from `bass_string`** (the string the root was picked from), raising or
+/// lowering by octaves until it lands within that specific string's fret
+/// range.
 ///
-/// Returns the fretted MIDI note for each interval, in order. Guarantees every
-/// output is a real fretted pitch in `MIDI_MIN..=MIDI_MAX` on a distinct string
-/// (so a chord of ≤6 tones is physically playable).
-pub fn fret_voicing(tuning: TuningId, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
+/// Returns the fretted MIDI note for each interval, in order. Guarantees
+/// every output is a real fretted pitch reachable on `tuning` — each note is
+/// clamped to its own string's `open..=open+FRET_COUNT`, never to a global
+/// constant, so no note can land outside the active tuning's playable range.
+pub fn fret_voicing(tuning: TuningId, bass_string: usize, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
     let strings = tuning.open_strings();
     let mut out = Vec::with_capacity(intervals.len());
     for (i, &iv) in intervals.iter().enumerate() {
-        let string = i.min(strings.len() - 1);
+        let string = (bass_string + i).min(strings.len() - 1);
         let open = strings[string];
+        let string_max = open.saturating_add(FRET_COUNT);
         let mut target = root_midi.saturating_add_signed(iv);
-        while target < open || target - open > FRET_COUNT {
+        while target < open {
             target = target.saturating_add(12);
-            if target > MIDI_MAX {
-                target = MIDI_MAX;
-                break;
-            }
         }
+        while target > string_max {
+            target = target.saturating_sub(12);
+        }
+        // Defensive: guarantees a real fret on this exact string even for an
+        // interval set wider than the calibrated bass-fret/interval range.
+        target = target.clamp(open, string_max);
         out.push(target);
     }
     out
@@ -330,7 +336,7 @@ mod tests {
     fn fret_voicing_in_range_and_on_valid_frets() {
         for root in [MIDI_MIN, 45, 50, 55, 60] {
             for q in ChordQuality::ALL {
-                let notes = fret_voicing(TuningId::AllFourths, root, q.intervals());
+                let notes = fret_voicing(TuningId::AllFourths, 0, root, q.intervals());
                 assert!(!notes.is_empty(), "empty voicing for {:?}", q);
                 for &n in &notes {
                     assert!(
@@ -376,7 +382,7 @@ mod tests {
         // Root E2=40, Major [0,4,7]: string0 fret0=40, string1 fret? target 44 →
         // open 45 too high, so raise to 44+12=56 → string1 open 45 fret 11=56.
         // Then 47 → open50 too high, +12=59 → string2 fret 9. Ascending voicing.
-        let v = fret_voicing(TuningId::AllFourths, 40, ChordQuality::Major.intervals());
+        let v = fret_voicing(TuningId::AllFourths, 0, 40, ChordQuality::Major.intervals());
         assert_eq!(v.len(), 3);
         assert!(v.windows(2).all(|w| w[1] >= w[0]));
         for &n in &v {
