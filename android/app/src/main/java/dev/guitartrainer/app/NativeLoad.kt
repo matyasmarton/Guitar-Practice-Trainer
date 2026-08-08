@@ -2,6 +2,7 @@ package dev.guitartrainer.app
 
 import dev.guitartrainer.Engine
 import dev.guitartrainer.createEngine
+import dev.guitartrainer.loadConfig
 import dev.guitartrainer.FfiConfig
 import dev.guitartrainer.EngineListener
 
@@ -15,4 +16,7 @@ import dev.guitartrainer.EngineListener
 object Native {
     fun createEngine(config: FfiConfig, listener: EngineListener): Engine =
         dev.guitartrainer.createEngine(config, listener)
+
+    /** Load the persisted config (or defaults) without constructing an Engine. */
+    fun loadConfig(): FfiConfig = dev.guitartrainer.loadConfig()
 }

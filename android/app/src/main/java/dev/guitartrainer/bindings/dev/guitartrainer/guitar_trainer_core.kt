@@ -749,6 +749,8 @@ internal open class UniffiVTableCallbackInterfaceEngineListener(
 
 
 
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -789,6 +791,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_guitar_trainer_core_fn_func_create_engine(`config`: RustBuffer.ByValue,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
+    fun uniffi_guitar_trainer_core_fn_func_load_config(uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun ffi_guitar_trainer_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun ffi_guitar_trainer_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -903,6 +907,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_guitar_trainer_core_checksum_func_create_engine(
     ): Short
+    fun uniffi_guitar_trainer_core_checksum_func_load_config(
+    ): Short
     fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_config(
     ): Short
     fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_progress(
@@ -935,6 +941,9 @@ private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_guitar_trainer_core_checksum_func_create_engine() != 6808.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_guitar_trainer_core_checksum_func_load_config() != 6007.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_guitar_trainer_core_checksum_method_engine_ffi_config() != 62595.toShort()) {
@@ -1611,7 +1620,9 @@ data class FfiConfig (
     var `enabled`: List<kotlin.String>, 
     var `randomMode`: kotlin.Boolean, 
     var `customContentPath`: kotlin.String?, 
-    var `audioDeviceName`: kotlin.String?
+    var `audioDeviceName`: kotlin.String?, 
+    var `tuning`: kotlin.String, 
+    var `matchPauseMs`: kotlin.UInt
 ) {
     
     companion object
@@ -1628,6 +1639,8 @@ public object FfiConverterTypeFfiConfig: FfiConverterRustBuffer<FfiConfig> {
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
@@ -1636,7 +1649,9 @@ public object FfiConverterTypeFfiConfig: FfiConverterRustBuffer<FfiConfig> {
             FfiConverterSequenceString.allocationSize(value.`enabled`) +
             FfiConverterBoolean.allocationSize(value.`randomMode`) +
             FfiConverterOptionalString.allocationSize(value.`customContentPath`) +
-            FfiConverterOptionalString.allocationSize(value.`audioDeviceName`)
+            FfiConverterOptionalString.allocationSize(value.`audioDeviceName`) +
+            FfiConverterString.allocationSize(value.`tuning`) +
+            FfiConverterUInt.allocationSize(value.`matchPauseMs`)
     )
 
     override fun write(value: FfiConfig, buf: ByteBuffer) {
@@ -1645,6 +1660,8 @@ public object FfiConverterTypeFfiConfig: FfiConverterRustBuffer<FfiConfig> {
             FfiConverterBoolean.write(value.`randomMode`, buf)
             FfiConverterOptionalString.write(value.`customContentPath`, buf)
             FfiConverterOptionalString.write(value.`audioDeviceName`, buf)
+            FfiConverterString.write(value.`tuning`, buf)
+            FfiConverterUInt.write(value.`matchPauseMs`, buf)
     }
 }
 
@@ -1735,6 +1752,16 @@ sealed class EngineEvent {
     
     
     /**
+     * Emitted once when a completed challenge triggers the post-match pause.
+     * UI frontends self-time an animation for `duration_ms` from receipt of
+     * this event; the engine does not emit further per-tick updates during it.
+     */
+    data class Cooldown(
+        val `durationMs`: kotlin.ULong) : EngineEvent() {
+        companion object
+    }
+    
+    /**
      * The timer expired with targets still outstanding.
      */
     object Timeout : EngineEvent()
@@ -1771,8 +1798,11 @@ public object FfiConverterTypeEngineEvent : FfiConverterRustBuffer<EngineEvent>{
                 FfiConverterULong.read(buf),
                 )
             4 -> EngineEvent.Passed
-            5 -> EngineEvent.Timeout
-            6 -> EngineEvent.Score(
+            5 -> EngineEvent.Cooldown(
+                FfiConverterULong.read(buf),
+                )
+            6 -> EngineEvent.Timeout
+            7 -> EngineEvent.Score(
                 FfiConverterUInt.read(buf),
                 FfiConverterUInt.read(buf),
                 )
@@ -1807,6 +1837,13 @@ public object FfiConverterTypeEngineEvent : FfiConverterRustBuffer<EngineEvent>{
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
+            )
+        }
+        is EngineEvent.Cooldown -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterULong.allocationSize(value.`durationMs`)
             )
         }
         is EngineEvent.Timeout -> {
@@ -1847,12 +1884,17 @@ public object FfiConverterTypeEngineEvent : FfiConverterRustBuffer<EngineEvent>{
                 buf.putInt(4)
                 Unit
             }
-            is EngineEvent.Timeout -> {
+            is EngineEvent.Cooldown -> {
                 buf.putInt(5)
+                FfiConverterULong.write(value.`durationMs`, buf)
+                Unit
+            }
+            is EngineEvent.Timeout -> {
+                buf.putInt(6)
                 Unit
             }
             is EngineEvent.Score -> {
-                buf.putInt(6)
+                buf.putInt(7)
                 FfiConverterUInt.write(value.`passed`, buf)
                 FfiConverterUInt.write(value.`total`, buf)
                 Unit
@@ -2085,6 +2127,19 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
     uniffiRustCallWithError(FfiException) { _status ->
     UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_func_create_engine(
         FfiConverterTypeFfiConfig.lower(`config`),FfiConverterTypeEngineListener.lower(`listener`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Load the persisted config (or defaults) without constructing an Engine.
+         * Lets a frontend seed its `FfiConfig` from disk before it has an Engine.
+         */ fun `loadConfig`(): FfiConfig {
+            return FfiConverterTypeFfiConfig.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_func_load_config(
+        _status)
 }
     )
     }

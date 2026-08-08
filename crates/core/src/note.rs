@@ -1,15 +1,17 @@
-//! MIDI note model for the all-fourths guitar.
+//! MIDI note model for the guitar trainer.
 //!
-//! A [`Note`] wraps a MIDI note number restricted to the playable range of a
-//! 6-string / 22-fret guitar tuned all-fourths (E2 A2 D3 G3 C4 F4):
-//! `MIDI_MIN..=MIDI_MAX` = `40..=89` (E2..F6).
+//! A [`Note`] wraps a MIDI note number restricted to the playable range
+//! spanning the lowest/highest reachable note across every supported tuning
+//! (see `crate::tuning::TuningId`): `MIDI_MIN..=MIDI_MAX` = `38..=89`
+//! (D2..F6). The floor comes from Drop-D All Fourths' open low string (D2);
+//! the ceiling from All Fourths' top string (F4) fretted to the 24th fret.
 //!
 //! Accidentals are always rendered as **sharps** (see [`Note::name`]).
 
 use std::fmt;
 
-/// Lowest playable note: open low-E string, E2 = MIDI 40.
-pub const MIDI_MIN: u8 = 40;
+/// Lowest playable note: Drop-D All Fourths' open low string, D2 = MIDI 38.
+pub const MIDI_MIN: u8 = 38;
 /// Highest playable note: top string (F4) + 22 frets = 65 + 22 = 87 (also
 /// covers 24-fret boards: 65 + 24 = 89). Cap kept generous.
 pub const MIDI_MAX: u8 = 89;
@@ -199,11 +201,11 @@ mod tests {
 
     #[test]
     fn range_invariant() {
-        assert_eq!(MIDI_MIN, 40);
+        assert_eq!(MIDI_MIN, 38);
         assert_eq!(MIDI_MAX, 89);
-        assert!(Note::from_midi(39).is_none());
+        assert!(Note::from_midi(37).is_none());
         assert!(Note::from_midi(90).is_none());
-        assert!(Note::from_midi(40).is_some());
+        assert!(Note::from_midi(38).is_some());
         assert!(Note::from_midi(89).is_some());
     }
 }

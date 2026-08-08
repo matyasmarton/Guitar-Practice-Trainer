@@ -30,6 +30,8 @@ pub struct FfiConfig {
     pub random_mode: bool,
     pub custom_content_path: Option<String>,
     pub audio_device_name: Option<String>,
+    pub tuning: String,
+    pub match_pause_ms: u32,
 }
 
 /// Timer progress reported across the FFI.
@@ -77,6 +79,8 @@ impl From<&Config> for FfiConfig {
             random_mode: c.random_mode,
             custom_content_path: c.custom_content_path.as_ref().map(|p| p.display().to_string()),
             audio_device_name: c.audio_device_name.clone(),
+            tuning: c.tuning.label().to_string(),
+            match_pause_ms: c.match_pause_ms,
         }
     }
 }
@@ -105,6 +109,12 @@ impl FfiConfig {
                 .as_ref()
                 .map(std::path::PathBuf::from),
             audio_device_name: self.audio_device_name.clone(),
+            tuning: crate::tuning::TuningId::ALL
+                .iter()
+                .find(|t| t.label() == self.tuning)
+                .copied()
+                .unwrap_or_default(),
+            match_pause_ms: self.match_pause_ms,
         }
     }
 }
@@ -116,6 +126,13 @@ pub fn create_engine(
     listener: Box<dyn EngineListener>,
 ) -> Result<Arc<Engine>, FfiError> {
     Engine::new(config.to_config(), listener).map(Arc::new).map_err(Into::into)
+}
+
+/// Load the persisted config (or defaults) without constructing an Engine.
+/// Lets a frontend seed its `FfiConfig` from disk before it has an Engine.
+#[uniffi::export]
+pub fn load_config() -> FfiConfig {
+    FfiConfig::from(&crate::config::load())
 }
 
 /// Engine methods exported across the FFI. Mirrors the public Rust API; the

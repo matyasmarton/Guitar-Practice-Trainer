@@ -57,6 +57,9 @@ pub struct Config {
     pub default_duration_sec: u32,
     /// Which challenge categories are active.
     pub enabled: EnumSet<EnabledCategory>,
+    /// Active guitar tuning.
+    #[serde(default)]
+    pub tuning: crate::tuning::TuningId,
     /// Random mode: randomize the time window *and* content per prompt.
     pub random_mode: bool,
     /// Optional path to a custom-content TOML file.
@@ -65,6 +68,15 @@ pub struct Config {
     /// Optional preferred input audio device name (Mac picker).
     #[serde(default)]
     pub audio_device_name: Option<String>,
+    /// Milliseconds to freeze pitch/timer processing after a challenge is fully
+    /// matched, before the next prompt appears (UI plays a completion animation
+    /// during this window). `0` disables the pause.
+    #[serde(default = "default_match_pause_ms")]
+    pub match_pause_ms: u32,
+}
+
+fn default_match_pause_ms() -> u32 {
+    3000
 }
 
 impl Default for Config {
@@ -72,9 +84,11 @@ impl Default for Config {
         Config {
             default_duration_sec: 30,
             enabled: EnumSet::all(),
+            tuning: crate::tuning::TuningId::default(),
             random_mode: false,
             custom_content_path: None,
             audio_device_name: None,
+            match_pause_ms: default_match_pause_ms(),
         }
     }
 }
@@ -189,5 +203,33 @@ mod tests {
         let p = dir.join("bad.toml");
         std::fs::write(&p, "this is = = not toml").unwrap();
         assert!(load_from(&p).is_err());
+    }
+
+    #[test]
+    fn defaults_to_all_fourths_tuning() {
+        assert_eq!(Config::default().tuning, crate::tuning::TuningId::AllFourths);
+    }
+
+    #[test]
+    fn defaults_match_pause_ms_3000() {
+        assert_eq!(Config::default().match_pause_ms, 3000);
+    }
+
+    #[test]
+    fn tuning_round_trip_toml() {
+        let mut c = Config::default();
+        c.tuning = crate::tuning::TuningId::Standard;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.tuning, crate::tuning::TuningId::Standard);
+    }
+
+    #[test]
+    fn config_without_new_fields_parses_with_defaults() {
+        // Simulates an already-deployed config.toml predating `tuning`/`match_pause_ms`.
+        let text = "default_duration_sec = 30\nenabled = []\nrandom_mode = false\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert_eq!(c.tuning, crate::tuning::TuningId::AllFourths);
+        assert_eq!(c.match_pause_ms, 3000);
     }
 }

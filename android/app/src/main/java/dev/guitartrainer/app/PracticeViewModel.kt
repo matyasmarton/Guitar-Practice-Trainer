@@ -20,7 +20,7 @@ data class UiState(
     val promptKind: String = "",
     val targets: List<String> = emptyList(),
     val ordered: Boolean = false,
-    val matched: Int = 0,
+    val matchedIndices: Set<Int> = emptySet(),
     val detectedNote: String? = null,
     val scorePassed: Int = 0,
     val scoreTotal: Int = 0,
@@ -29,6 +29,8 @@ data class UiState(
     val promptSecs: ULong = 0uL,
     val running: Boolean = false,
     val statusMessage: String? = null,
+    /** Wall-clock deadline (`System.currentTimeMillis()`) of the current post-match cooldown, if active. */
+    val cooldownUntilMs: Long? = null,
 )
 
 /**
@@ -51,11 +53,16 @@ class PracticeViewModel : ViewModel() {
                     detectedNote = ev.v1 ?: "—"
                 )
                 is EngineEvent.Matched -> _ui.value = _ui.value.copy(
-                    matched = (_ui.value.matched + 1).coerceAtMost(ev.total.toInt())
+                    matchedIndices = _ui.value.matchedIndices + ev.index.toInt()
                 )
                 is EngineEvent.Passed ->
-                    _ui.value = _ui.value.copy(matched = _ui.value.targets.size)
-                is EngineEvent.Timeout -> _ui.value = _ui.value.copy(matched = 0)
+                    _ui.value = _ui.value.copy(
+                        matchedIndices = (0 until _ui.value.targets.size).toSet()
+                    )
+                is EngineEvent.Cooldown -> _ui.value = _ui.value.copy(
+                    cooldownUntilMs = System.currentTimeMillis() + ev.durationMs.toLong()
+                )
+                is EngineEvent.Timeout -> _ui.value = _ui.value.copy(matchedIndices = emptySet())
                 is EngineEvent.Score -> _ui.value = _ui.value.copy(
                     scorePassed = ev.passed.toInt(),
                     scoreTotal = ev.total.toInt(),
@@ -70,7 +77,7 @@ class PracticeViewModel : ViewModel() {
             promptKind = v.kind,
             targets = v.targets,
             ordered = v.ordered,
-            matched = 0,
+            matchedIndices = emptySet(),
         )
     }
 
@@ -101,10 +108,12 @@ class PracticeViewModel : ViewModel() {
     fun pollProgress() {
         val eng = engine ?: return
         val p: FfiProgress = eng.ffiProgress()
+        val stillCooling = _ui.value.cooldownUntilMs?.let { System.currentTimeMillis() < it } ?: false
         _ui.value = _ui.value.copy(
             timeFrac = p.frac,
             timeSecs = p.secs,
             promptSecs = p.promptSecs,
+            cooldownUntilMs = if (stillCooling) _ui.value.cooldownUntilMs else null,
         )
     }
 

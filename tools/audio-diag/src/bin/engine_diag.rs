@@ -23,6 +23,7 @@ impl EngineListener for PrintListener {
             EngineEvent::DetectedNote(n) => format!("DETECTED: {:?}", n),
             EngineEvent::Matched { index, total } => format!("MATCHED: {}/{}", index, total),
             EngineEvent::Passed => "PASSED".to_string(),
+            EngineEvent::Cooldown { duration_ms } => format!("COOLDOWN: {}ms", duration_ms),
             EngineEvent::Timeout => "TIMEOUT".to_string(),
             EngineEvent::Score { passed, total } => format!("SCORE: {}/{}", passed, total),
         };

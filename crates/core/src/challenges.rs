@@ -18,6 +18,7 @@ use crate::music::{
 use crate::note::{Note, MIDI_MAX, MIDI_MIN};
 use crate::pieces::midi_of;
 use crate::progressions::{degree_label, PROGRESSIONS};
+use crate::tuning::TuningId;
 
 /// The seven prompt categories. The enabled-set is derived from this and the
 /// "Random" draw uniformly samples among enabled categories.
@@ -80,14 +81,15 @@ pub fn generate<R: Rng>(
     kind: ChallengeType,
     rng: &mut R,
     library: &ContentLibrary,
+    tuning: TuningId,
 ) -> Challenge {
     match kind {
         ChallengeType::Note => gen_note(rng),
-        ChallengeType::Chord => gen_chord(rng),
-        ChallengeType::Scale => gen_scale(rng),
-        ChallengeType::Mode => gen_mode(rng),
+        ChallengeType::Chord => gen_chord(rng, tuning),
+        ChallengeType::Scale => gen_scale(rng, tuning),
+        ChallengeType::Mode => gen_mode(rng, tuning),
         ChallengeType::Progression => gen_progression(rng),
-        ChallengeType::Lick => gen_lick(rng, library),
+        ChallengeType::Lick => gen_lick(rng, tuning, library),
         ChallengeType::Piece => gen_piece(rng, library),
     }
 }
@@ -107,14 +109,14 @@ fn gen_note<R: Rng>(rng: &mut R) -> Challenge {
     }
 }
 
-fn gen_chord<R: Rng>(rng: &mut R) -> Challenge {
+fn gen_chord<R: Rng>(rng: &mut R, tuning: TuningId) -> Challenge {
     // Random root fret (0..=14) on a random bass string (0..=4).
     let bass_string: usize = rng.gen_range(0..5);
     let fret: u8 = rng.gen_range(0..=15);
-    let open = crate::tuning::ALL_FOURTHS[bass_string];
+    let open = tuning.open_strings()[bass_string];
     let root_midi = open + fret;
     let q = ChordQuality::ALL[rng.gen_range(0..ChordQuality::ALL.len())];
-    let voicing = fret_voicing(root_midi, q.intervals());
+    let voicing = fret_voicing(tuning, root_midi, q.intervals());
     let targets: Vec<Note> = voicing
         .iter()
         .copied()
@@ -135,10 +137,10 @@ fn gen_chord<R: Rng>(rng: &mut R) -> Challenge {
     }
 }
 
-fn gen_scale<R: Rng>(rng: &mut R) -> Challenge {
+fn gen_scale<R: Rng>(rng: &mut R, tuning: TuningId) -> Challenge {
     let root_midi = random_root(rng);
     let st = ScaleType::ALL[rng.gen_range(0..ScaleType::ALL.len())];
-    let notes = fret_notes(root_midi, st.intervals());
+    let notes = fret_notes(tuning, root_midi, st.intervals());
     let targets: Vec<Note> = notes.iter().copied().map(Note::from_midi_clamped).collect();
     let root_name = Note::from_midi_clamped(root_midi).name();
     let display = format!("{} {}", root_name, st.name());
@@ -150,10 +152,10 @@ fn gen_scale<R: Rng>(rng: &mut R) -> Challenge {
     }
 }
 
-fn gen_mode<R: Rng>(rng: &mut R) -> Challenge {
+fn gen_mode<R: Rng>(rng: &mut R, tuning: TuningId) -> Challenge {
     let root_midi = random_root(rng);
     let m = Mode::ALL[rng.gen_range(0..Mode::ALL.len())];
-    let notes = fret_notes(root_midi, m.intervals());
+    let notes = fret_notes(tuning, root_midi, m.intervals());
     let targets: Vec<Note> = notes.iter().copied().map(Note::from_midi_clamped).collect();
     let root_name = Note::from_midi_clamped(root_midi).name();
     let display = format!("{} {}", root_name, m.name());
@@ -194,12 +196,12 @@ fn gen_progression<R: Rng>(rng: &mut R) -> Challenge {
     }
 }
 
-fn gen_lick<R: Rng>(rng: &mut R, library: &ContentLibrary) -> Challenge {
+fn gen_lick<R: Rng>(rng: &mut R, tuning: TuningId, library: &ContentLibrary) -> Challenge {
     if library.licks.is_empty() {
         return gen_note(rng); // graceful fallback
     }
     let lick = &library.licks[rng.gen_range(0..library.licks.len())];
-    let (_root_midi, notes) = transpose_intervals(&lick.intervals);
+    let (_root_midi, notes) = transpose_intervals(tuning, &lick.intervals);
     let targets: Vec<Note> = notes.iter().copied().map(Note::from_midi_clamped).collect();
     let head: Vec<String> = targets
         .iter()
@@ -254,7 +256,7 @@ fn random_root<R: Rng>(rng: &mut R) -> u8 {
 
 /// Transpose an interval set so its lowest realized pitch ≥ MIDI_MIN, then
 /// fret-voice each degree (re-voicing per degree). Returns (root_midi, notes).
-fn transpose_intervals(intervals: &[i8]) -> (u8, Vec<u8>) {
+fn transpose_intervals(tuning: TuningId, intervals: &[i8]) -> (u8, Vec<u8>) {
     // Start near the lowest string; lift root if any note would dip below range.
     let min_iv = *intervals.iter().min().unwrap_or(&0) as i16;
     // Choose a root such that root + min_iv >= MIDI_MIN, but keep root >=40.
@@ -266,7 +268,7 @@ fn transpose_intervals(intervals: &[i8]) -> (u8, Vec<u8>) {
         }
     }
     let root_midi = root.clamp(MIDI_MIN as i16, MIDI_MAX as i16) as u8;
-    let notes = fret_notes(root_midi, intervals);
+    let notes = fret_notes(tuning, root_midi, intervals);
     (root_midi, notes)
 }
 
@@ -295,7 +297,7 @@ mod tests {
     #[test]
     fn chord_has_multiple_targets_in_range() {
         for _ in 0..50 {
-            let c = gen_chord(&mut rng());
+            let c = gen_chord(&mut rng(), TuningId::AllFourths);
             assert!(c.targets.len() >= 3);
             assert!(!c.ordered);
             for n in &c.targets {
@@ -307,7 +309,7 @@ mod tests {
     #[test]
     fn scale_ordered_and_in_range() {
         for _ in 0..50 {
-            let c = gen_scale(&mut rng());
+            let c = gen_scale(&mut rng(), TuningId::AllFourths);
             assert!(c.ordered);
             for n in &c.targets {
                 assert!((MIDI_MIN..=MIDI_MAX).contains(&n.midi()));
@@ -318,7 +320,7 @@ mod tests {
     #[test]
     fn mode_ordered_and_in_range() {
         for _ in 0..50 {
-            let c = gen_mode(&mut rng());
+            let c = gen_mode(&mut rng(), TuningId::AllFourths);
             assert!(c.ordered);
             assert!(!c.targets.is_empty());
         }
@@ -353,7 +355,7 @@ mod tests {
     fn lick_and_piece_in_range_and_ordered() {
         let l = lib();
         for _ in 0..50 {
-            let c = gen_lick(&mut rng(), &l);
+            let c = gen_lick(&mut rng(), TuningId::AllFourths, &l);
             assert!(c.ordered);
             assert!(!c.targets.is_empty());
             for n in &c.targets {
@@ -374,7 +376,7 @@ mod tests {
     fn all_kinds_generate() {
         let l = lib();
         for kind in ChallengeType::ALL {
-            let c = generate(kind, &mut rng(), &l);
+            let c = generate(kind, &mut rng(), &l, TuningId::AllFourths);
             assert!(!c.targets.is_empty(), "{:?} produced no targets", kind);
             assert!(!c.display.is_empty());
         }

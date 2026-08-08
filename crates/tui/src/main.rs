@@ -30,6 +30,8 @@ use guitar_trainer_core::audio;
 use guitar_trainer_core::challenges::ChallengeType;
 use guitar_trainer_core::config::{Config, EnabledCategory};
 use guitar_trainer_core::engine::{Engine, EngineEvent, EngineListener};
+use guitar_trainer_core::theme::Theme;
+use guitar_trainer_core::tuning::TuningId;
 
 /// UI-facing snapshot derived from engine events + `engine.progress()`.
 #[derive(Default, Clone)]
@@ -39,6 +41,9 @@ struct UiState {
     targets: Vec<String>,
     ordered: bool,
     matched: usize,
+    /// Per-target matched flags (same length as `targets`); drives the
+    /// green matched-target highlight independent of the aggregate count.
+    matched_indices: Vec<bool>,
     detected_note: Option<String>,
     score_passed: u32,
     score_total: u32,
@@ -49,6 +54,10 @@ struct UiState {
     running: bool,
     /// One-line status/error banner (e.g. mic permission failure).
     status: Option<String>,
+    /// Wall-clock start of the current post-match cooldown, if active.
+    cooldown_started: Option<std::time::Instant>,
+    /// Duration of the current/most recent cooldown.
+    cooldown_ms: u64,
 }
 
 /// Channel-backed listener: the render loop drains `rx`.
@@ -85,8 +94,8 @@ enum Edit {
 
 const MENU_ITEMS: [&str; 3] = ["Start Practice", "Settings", "Quit"];
 const PRACTICE_ACTIONS: [&str; 3] = ["Stop", "Skip", "Settings"];
-/// Settings rows: 0=Timer 1=Random 2..=8=categories(7) 9=Audio Device 10=Custom Path 11=Back.
-const SETTINGS_ROW_COUNT: usize = 12;
+/// Settings rows: 0=Timer 1=Tuning 2=Random 3..=9=categories(7) 10=Audio Device 11=Custom Path 12=Back.
+const SETTINGS_ROW_COUNT: usize = 13;
 
 struct App {
     screen: Screen,
@@ -154,6 +163,7 @@ fn main() -> Result<()> {
     let (tx, rx) = crossbeam_channel::bounded::<EngineEvent>(512);
     let listener = Box::new(ChannelListener { tx });
     let config = guitar_trainer_core::config::load();
+    let theme = guitar_trainer_core::theme::load();
     let engine = Engine::new(config, listener)?;
     let engine = Arc::new(engine);
 
@@ -183,10 +193,10 @@ fn main() -> Result<()> {
         terminal.draw(|f| {
             let area = f.area();
             match app.screen {
-                Screen::Menu => draw_menu(f, area, &app, &ui, &settings),
-                Screen::Practice => draw_practice(f, area, &app, &ui, &settings),
-                Screen::Settings => draw_settings(f, area, &app, &settings),
-                Screen::DevicePick => draw_device_pick(f, area, &app, &settings),
+                Screen::Menu => draw_menu(f, area, &app, &ui, &settings, &theme),
+                Screen::Practice => draw_practice(f, area, &app, &ui, &settings, &theme),
+                Screen::Settings => draw_settings(f, area, &app, &settings, &theme),
+                Screen::DevicePick => draw_device_pick(f, area, &app, &settings, &theme),
             }
         })?;
     }
@@ -222,12 +232,20 @@ fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
             ui.targets = v.targets.clone();
             ui.ordered = v.ordered;
             ui.matched = 0;
+            ui.matched_indices = vec![false; v.targets.len()];
         }
         EngineEvent::DetectedNote(n) => ui.detected_note = n.clone(),
-        EngineEvent::Matched { index: _, total } => {
-            ui.matched = ui.matched.saturating_add(1).min(*total as usize);
+        EngineEvent::Matched { index, total: _ } => {
+            if let Some(slot) = ui.matched_indices.get_mut(*index as usize) {
+                *slot = true;
+            }
+            ui.matched = ui.matched_indices.iter().filter(|&&m| m).count();
         }
         EngineEvent::Passed => {}
+        EngineEvent::Cooldown { duration_ms } => {
+            ui.cooldown_started = Some(std::time::Instant::now());
+            ui.cooldown_ms = *duration_ms;
+        }
         EngineEvent::Timeout => {
             ui.matched = 0;
         }
@@ -245,10 +263,14 @@ fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
 #[derive(Default, Clone)]
 struct SettingsState {
     duration_sec: u32,
+    tuning: TuningId,
     enabled: Vec<(ChallengeType, bool)>,
     random_mode: bool,
     custom_path: String,
     audio_device: Option<String>,
+    /// Not user-editable in this screen; preserved so saving other settings
+    /// never clobbers the persisted cooldown duration back to a default.
+    match_pause_ms: u32,
 }
 
 impl SettingsState {
@@ -263,6 +285,7 @@ impl SettingsState {
             .collect();
         SettingsState {
             duration_sec: cfg.default_duration_sec,
+            tuning: cfg.tuning,
             enabled,
             random_mode: cfg.random_mode,
             custom_path: cfg
@@ -271,6 +294,7 @@ impl SettingsState {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             audio_device: cfg.audio_device_name.clone(),
+            match_pause_ms: cfg.match_pause_ms,
         }
     }
 
@@ -286,6 +310,7 @@ impl SettingsState {
         }
         Config {
             default_duration_sec: self.duration_sec.max(1),
+            tuning: self.tuning,
             enabled: set,
             random_mode: self.random_mode,
             custom_content_path: if self.custom_path.is_empty() {
@@ -294,6 +319,7 @@ impl SettingsState {
                 Some(std::path::PathBuf::from(&self.custom_path))
             },
             audio_device_name: self.audio_device.clone(),
+            match_pause_ms: self.match_pause_ms,
         }
     }
 }
@@ -475,14 +501,18 @@ fn handle_settings_key(
                 app.edit = Edit::Timer;
                 app.edit_buf = settings.duration_sec.to_string();
             }
-            1 => settings.random_mode = !settings.random_mode,
-            2..=8 => {
-                let i = app.settings_idx - 2;
+            1 => {
+                let idx = TuningId::ALL.iter().position(|&t| t == settings.tuning).unwrap_or(0);
+                settings.tuning = TuningId::ALL[(idx + 1) % TuningId::ALL.len()];
+            }
+            2 => settings.random_mode = !settings.random_mode,
+            3..=9 => {
+                let i = app.settings_idx - 3;
                 if let Some(slot) = settings.enabled.get_mut(i) {
                     slot.1 = !slot.1;
                 }
             }
-            9 => {
+            10 => {
                 start_device_scan(app);
                 app.device_idx = settings
                     .audio_device
@@ -491,11 +521,11 @@ fn handle_settings_key(
                     .unwrap_or(0);
                 app.screen = Screen::DevicePick;
             }
-            10 => {
+            11 => {
                 app.edit = Edit::Path;
                 app.edit_buf = settings.custom_path.clone();
             }
-            11 => {
+            12 => {
                 apply_settings(settings, engine);
                 app.screen = if ui.running { Screen::Practice } else { Screen::Menu };
             }
@@ -540,14 +570,39 @@ fn handle_device_pick_key(
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn selection_style() -> Style {
+/// Parse a `#RRGGBB` hex string into a ratatui `Color`; any parse failure
+/// (missing file, malformed hex) falls back to `fallback` so a broken
+/// `theme.toml` never breaks rendering.
+fn parse_color(hex: &str, fallback: Color) -> Color {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return fallback;
+    }
+    let (Ok(r), Ok(g), Ok(b)) = (
+        u8::from_str_radix(&hex[0..2], 16),
+        u8::from_str_radix(&hex[2..4], 16),
+        u8::from_str_radix(&hex[4..6], 16),
+    ) else {
+        return fallback;
+    };
+    Color::Rgb(r, g, b)
+}
+
+fn selection_style(theme: &Theme) -> Style {
     Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
+        .fg(parse_color(&theme.selection_fg, Color::Black))
+        .bg(parse_color(&theme.selection_bg, Color::Yellow))
         .add_modifier(Modifier::BOLD)
 }
 
-fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState, settings: &SettingsState) {
+fn draw_menu(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(3)])
@@ -565,7 +620,7 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState, se
                 .borders(Borders::ALL)
                 .title(" Menu — ↑↓ select, Enter to activate "),
         )
-        .highlight_style(selection_style())
+        .highlight_style(selection_style(theme))
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.menu_idx));
@@ -576,10 +631,10 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState, se
         .clone()
         .unwrap_or_else(|| "(default mic)".to_string());
     let (footer_text, footer_style) = match &ui.status {
-        Some(msg) => (msg.clone(), Style::default().fg(Color::Red)),
+        Some(msg) => (msg.clone(), Style::default().fg(parse_color(&theme.danger, Color::Red))),
         None => (
             format!("mic: {device_name}   ✓{}/{}", ui.score_passed, ui.score_total),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(parse_color(&theme.secondary, Color::Cyan)),
         ),
     };
     let footer = Paragraph::new(footer_text)
@@ -588,7 +643,14 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState, se
     f.render_widget(footer, chunks[2]);
 }
 
-fn draw_practice(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState, settings: &SettingsState) {
+fn draw_practice(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -604,24 +666,43 @@ fn draw_practice(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState
         format!(" {} ", ui.prompt_kind),
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    let targets_line = if ui.ordered {
-        format!("[{}/{}]  {}", ui.matched, ui.targets.len(), ui.targets.join(" → "))
+    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
+    let targets_line: Line = if ui.ordered {
+        let mut spans = vec![Span::raw(format!("[{}/{}]  ", ui.matched, ui.targets.len()))];
+        for (i, t) in ui.targets.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" → "));
+            }
+            if ui.matched_indices.get(i).copied().unwrap_or(false) {
+                spans.push(Span::styled(t.clone(), success_style));
+            } else {
+                spans.push(Span::raw(t.clone()));
+            }
+        }
+        Line::from(spans)
     } else {
-        let ticks: Vec<String> = (0..ui.targets.len())
-            .map(|i| {
-                if i < ui.matched {
-                    format!("[✓{}]", ui.targets.get(i).cloned().unwrap_or_default())
-                } else {
-                    format!("[  {}]", ui.targets.get(i).cloned().unwrap_or_default())
-                }
-            })
-            .collect();
-        format!("{}  {}", ui.matched, ticks.join(" "))
+        let mut spans = vec![Span::raw(format!("{}  ", ui.matched))];
+        for (i, t) in ui.targets.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            if ui.matched_indices.get(i).copied().unwrap_or(false) {
+                spans.push(Span::styled(format!("[✓{}]", t), success_style));
+            } else {
+                spans.push(Span::raw(format!("[  {}]", t)));
+            }
+        }
+        Line::from(spans)
     };
-    let p = Paragraph::new(format!("\n{}\n\n{}", ui.prompt_display, targets_line))
-        .block(prompt_block)
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
+    let p = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(ui.prompt_display.clone()),
+        Line::from(""),
+        targets_line,
+    ])
+    .block(prompt_block)
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: true });
     f.render_widget(p, chunks[0]);
 
     // Timer (L) + detected note (R).
@@ -629,7 +710,11 @@ fn draw_practice(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[1]);
-    let gauge_color = if ui.time_left_secs <= 5 { Color::Red } else { Color::Green };
+    let gauge_color = if ui.time_left_secs <= 5 {
+        parse_color(&theme.danger, Color::Red)
+    } else {
+        parse_color(&theme.success, Color::Green)
+    };
     let gauge = Gauge::default()
         .block(Block::default().borders(Borders::ALL).title(" Timer "))
         .gauge_style(Style::default().fg(gauge_color))
@@ -637,9 +722,27 @@ fn draw_practice(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState
         .label(format!("{}s / {}s", ui.time_left_secs, ui.prompt_secs));
     f.render_widget(gauge, mid[0]);
     let detected_text = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
+    // During the post-match cooldown, blink the Detected panel (alternating
+    // reversed/success and plain accent styles every 200ms) as an obvious
+    // "matched, hold on" cue; otherwise render with the plain accent style.
+    let accent_style = Style::default().fg(parse_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
+    let cooldown_active = ui
+        .cooldown_started
+        .map(|t| t.elapsed() < Duration::from_millis(ui.cooldown_ms))
+        .unwrap_or(false);
+    let detected_style = if cooldown_active {
+        let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200) % 2 == 0;
+        if blink_on {
+            success_style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            accent_style
+        }
+    } else {
+        accent_style
+    };
     let det = Paragraph::new(format!(" {}", detected_text))
         .block(Block::default().borders(Borders::ALL).title(" Detected "))
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        .style(detected_style);
     f.render_widget(det, mid[1]);
 
     // Score + device line.
@@ -652,7 +755,7 @@ fn draw_practice(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState
         ui.score_passed, ui.score_total, device_name
     ))
     .alignment(Alignment::Center)
-    .style(Style::default().fg(Color::Cyan));
+    .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)));
     f.render_widget(score_line, chunks[2]);
 
     // Footer action bar: Stop / Skip / Settings, current one highlighted.
@@ -662,7 +765,7 @@ fn draw_practice(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState
             spans.push(Span::raw("    "));
         }
         if i == app.practice_idx {
-            spans.push(Span::styled(format!(" {label} "), selection_style()));
+            spans.push(Span::styled(format!(" {label} "), selection_style(theme)));
         } else {
             spans.push(Span::raw(format!(" {label} ")));
         }
@@ -677,7 +780,7 @@ fn draw_practice(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, ui: &UiState
     f.render_widget(footer, chunks[3]);
 }
 
-fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState) {
+fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
     let block = Block::default().borders(Borders::ALL).title(
         " Settings — ↑↓ select, Enter to toggle/edit, Esc to save & back ",
     );
@@ -688,7 +791,7 @@ fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &S
         .map(|i| ListItem::new(settings_row_label(i, app, settings)))
         .collect();
     let list = List::new(items)
-        .highlight_style(selection_style())
+        .highlight_style(selection_style(theme))
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.settings_idx));
@@ -704,16 +807,17 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
                 format!("Timer (seconds): {}", settings.duration_sec)
             }
         }
-        1 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
-        2..=8 => {
-            let (c, on) = &settings.enabled[i - 2];
+        1 => format!("Tuning: {}", settings.tuning.label()),
+        2 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
+        3..=9 => {
+            let (c, on) = &settings.enabled[i - 3];
             format!("[{}] {}", if *on { "✓" } else { " " }, c.label())
         }
-        9 => format!(
+        10 => format!(
             "Audio device: {}",
             settings.audio_device.clone().unwrap_or_else(|| "(default mic)".to_string())
         ),
-        10 => {
+        11 => {
             if app.edit == Edit::Path {
                 format!("Custom content path: {}█", app.edit_buf)
             } else {
@@ -725,12 +829,12 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
                 format!("Custom content path: {p}")
             }
         }
-        11 => "← Back (save & return)".to_string(),
+        12 => "← Back (save & return)".to_string(),
         _ => String::new(),
     }
 }
 
-fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState) {
+fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
     let block = Block::default().borders(Borders::ALL).title(
         " Audio Device — ↑↓ select, Enter to choose, Esc to cancel ",
     );
@@ -754,7 +858,7 @@ fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings:
     }
 
     let list = List::new(items)
-        .highlight_style(selection_style())
+        .highlight_style(selection_style(theme))
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.device_idx));

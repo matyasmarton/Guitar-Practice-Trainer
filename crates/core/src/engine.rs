@@ -59,6 +59,10 @@ pub enum EngineEvent {
     Matched { index: u64, total: u64 },
     /// All targets matched before the timer expired.
     Passed,
+    /// Emitted once when a completed challenge triggers the post-match pause.
+    /// UI frontends self-time an animation for `duration_ms` from receipt of
+    /// this event; the engine does not emit further per-tick updates during it.
+    Cooldown { duration_ms: u64 },
     /// The timer expired with targets still outstanding.
     Timeout,
     /// Running score.
@@ -103,6 +107,10 @@ struct EngineInner {
     last_emitted_note: Option<String>,
     score_passed: u32,
     score_total: u32,
+    /// Time remaining in the post-match pause; `Duration::ZERO` when idle.
+    /// While nonzero, `handle_pitch` ignores mic input and `handle_tick`
+    /// decrements this instead of the countdown.
+    cooldown_remaining: Duration,
 }
 
 impl EngineInner {
@@ -179,9 +187,10 @@ impl Engine {
             last_emitted_note: None,
             score_passed: 0,
             score_total: 0,
+            cooldown_remaining: Duration::ZERO,
         };
         // Pick an initial prompt so the engine always has a `current`.
-        pick_new_prompt(&mut inner, &cats);
+        pick_new_prompt(&mut inner, &cats, config.tuning);
         // Do not start the timer until `start()`.
         Ok(Engine {
             inner: Arc::new(Mutex::new(inner)),
@@ -214,7 +223,8 @@ impl Engine {
         {
             let mut inner = self.inner.lock();
             let cats = inner.config.active_categories();
-            pick_new_prompt(&mut inner, &cats);
+            let tuning = inner.config.tuning;
+            pick_new_prompt(&mut inner, &cats, tuning);
             reset_timer(&mut inner);
             emit_prompt(&self.listener, &inner);
             emit_score(&self.listener, &inner);
@@ -273,7 +283,8 @@ impl Engine {
         let mut inner = self.inner.lock();
         emit(&self.listener, EngineEvent::Timeout);
         inner.score_total += 1;
-        pick_new_prompt(&mut inner, &cats);
+        let tuning = inner.config.tuning;
+        pick_new_prompt(&mut inner, &cats, tuning);
         reset_timer(&mut inner);
         emit_prompt(&self.listener, &inner);
         emit_score(&self.listener, &inner);
@@ -368,12 +379,12 @@ fn run_driver(
 // Core logic (pure, testable)
 // ---------------------------------------------------------------------------
 
-fn pick_new_prompt(inner: &mut EngineInner, cats: &[ChallengeType]) {
+fn pick_new_prompt(inner: &mut EngineInner, cats: &[ChallengeType], tuning: crate::tuning::TuningId) {
     if cats.is_empty() {
         return;
     }
     let kind = cats[inner.rng.gen_range(0..cats.len())];
-    let challenge = generate(kind, &mut inner.rng, &inner.library);
+    let challenge = generate(kind, &mut inner.rng, &inner.library, tuning);
     inner.current = challenge;
     inner.matched = vec![false; inner.current.targets.len()];
     inner.next_idx = 0;
@@ -405,6 +416,9 @@ fn handle_pitch(
     cats: &[ChallengeType],
     hz: Option<f64>,
 ) {
+    if inner.cooldown_remaining > Duration::ZERO {
+        return;
+    }
     let midi = match hz.and_then(Note::from_hz) {
         Some(n) => Some(n.midi()),
         None => None,
@@ -514,10 +528,17 @@ fn accept_match(
         inner.score_passed += 1;
         inner.score_total += 1;
         emit_score(listener, inner);
-        pick_new_prompt(inner, cats);
-        reset_timer(inner);
-        emit_prompt(listener, inner);
-        emit_score(listener, inner);
+        let pause_ms = inner.config.match_pause_ms;
+        if pause_ms > 0 {
+            inner.cooldown_remaining = Duration::from_millis(pause_ms as u64);
+            emit(listener, EngineEvent::Cooldown { duration_ms: pause_ms as u64 });
+        } else {
+            let tuning = inner.config.tuning;
+            pick_new_prompt(inner, cats, tuning);
+            reset_timer(inner);
+            emit_prompt(listener, inner);
+            emit_score(listener, inner);
+        }
     }
 }
 
@@ -527,6 +548,17 @@ fn handle_tick(
     cats: &[ChallengeType],
     dt: Duration,
 ) {
+    if inner.cooldown_remaining > Duration::ZERO {
+        inner.cooldown_remaining = inner.cooldown_remaining.saturating_sub(dt);
+        if inner.cooldown_remaining == Duration::ZERO {
+            let tuning = inner.config.tuning;
+            pick_new_prompt(inner, cats, tuning);
+            reset_timer(inner);
+            emit_prompt(listener, inner);
+            emit_score(listener, inner);
+        }
+        return;
+    }
     if inner.remaining == Duration::ZERO {
         return;
     }
@@ -535,7 +567,8 @@ fn handle_tick(
         emit(listener, EngineEvent::Timeout);
         inner.score_total += 1;
         emit_score(listener, inner);
-        pick_new_prompt(inner, cats);
+        let tuning = inner.config.tuning;
+        pick_new_prompt(inner, cats, tuning);
         reset_timer(inner);
         emit_prompt(listener, inner);
         emit_score(listener, inner);
@@ -626,7 +659,8 @@ mod tests {
         // prompt chain by setting an initial prompt (mirrors start() minus audio).
         let cats = eng.inner.lock().config.active_categories();
         let mut inner = eng.inner.lock();
-        pick_new_prompt(&mut inner, &cats);
+        let tuning = inner.config.tuning;
+        pick_new_prompt(&mut inner, &cats, tuning);
         reset_timer(&mut inner);
         emit_prompt(&eng.listener, &inner);
         emit_score(&eng.listener, &inner);
@@ -656,6 +690,7 @@ mod tests {
         // Drive a single matching pitch twice (stability ≥2 → accept).
         eng.on_pitch(Some(target_hz));
         eng.on_pitch(Some(target_hz));
+        eng.on_tick(Duration::from_millis(3000)); // exhaust the default match_pause_ms cooldown
         // In-hand: the note prompt is unordered with one target; one accept → Passed.
         // Note: Note challenges may sometimes be ordered? They are `ordered=false`.
         let got = collect(&evs);
@@ -750,7 +785,8 @@ mod tests {
             // Re-roll by emitting a new prompt; deterministic seed: re-pick.
             let cats = eng.inner.lock().config.active_categories();
             let mut g = eng.inner.lock();
-            pick_new_prompt(&mut g, &cats);
+            let tuning = g.config.tuning;
+            pick_new_prompt(&mut g, &cats, tuning);
         }
         let targets = eng.inner.lock().current.targets.clone();
         assert!(targets.len() >= 2, "need ≥2 scale targets for ordering test");
@@ -777,5 +813,56 @@ mod tests {
         assert!(got
             .iter()
             .any(|e| matches!(e, EngineEvent::Matched { index: 0, .. })));
+    }
+
+    #[test]
+    fn cooldown_gates_advance_and_pitch_processing() {
+        let (rec, evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.enabled = crate::config::EnabledCategory::Note.into();
+        cfg.match_pause_ms = 500;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+
+        let target_hz = {
+            let g = eng.inner.lock();
+            g.current.targets[0].hz()
+        };
+
+        eng.on_pitch(Some(target_hz));
+        eng.on_pitch(Some(target_hz));
+
+        let got = collect(&evs);
+        let cooldown_count = got
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Cooldown { duration_ms: 500 }))
+            .count();
+        assert_eq!(cooldown_count, 1, "expected exactly one Cooldown{{500}}: {got:?}");
+        let prompt_count = got
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Prompt(_)))
+            .count();
+        assert_eq!(prompt_count, 1, "no second Prompt should appear yet: {got:?}");
+
+        // Mic input during the freeze must be a no-op (no additional Matched/Score).
+        let (matched_before, score_before) = {
+            let g = eng.inner.lock();
+            (g.matched_count, g.score_passed)
+        };
+        eng.on_pitch(Some(target_hz));
+        let (matched_after, score_after) = {
+            let g = eng.inner.lock();
+            (g.matched_count, g.score_passed)
+        };
+        assert_eq!(matched_before, matched_after, "matched_count changed during cooldown");
+        assert_eq!(score_before, score_after, "score_passed changed during cooldown");
+
+        eng.on_tick(Duration::from_millis(500));
+        let got = collect(&evs);
+        let prompt_count = got
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Prompt(_)))
+            .count();
+        assert_eq!(prompt_count, 2, "expected a second Prompt after cooldown expiry: {got:?}");
     }
 }
