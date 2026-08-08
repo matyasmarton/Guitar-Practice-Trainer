@@ -1,0 +1,2 @@
+# cargo-ndk builds the per-ABI .so files into this directory (see `make android`).
+# Generated: libguitar_trainer_core.so for aarch64/armv7/x86_64.

@@ -1,0 +1,16 @@
+[package]
+name = "audio-diag"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "audio-diag"
+path = "src/main.rs"
+
+[dependencies]
+guitar_trainer_core = { path = "../../crates/core" }
+crossbeam-channel = "0.5"
+cpal = "0.17"
+anyhow = "1"
+parking_lot = "0.12"

@@ -1,0 +1,19 @@
+[package]
+name = "guitar_trainer_tui"
+description = "Terminal UI for the guitar practice trainer (macOS)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "guitar-trainer"
+path = "src/main.rs"
+
+[dependencies]
+guitar_trainer_core.workspace = true
+anyhow.workspace = true
+ratatui = "0.28"
+crossterm = "0.28"
+crossbeam-channel = "0.5"
+scopeguard = "1"
+enumset = "1.1"

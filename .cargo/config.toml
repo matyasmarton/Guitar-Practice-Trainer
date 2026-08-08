@@ -1,0 +1,15 @@
+# Build config for the guitar-practice-trainer workspace.
+#
+# `cargo-ndk` (recommended) sets these linkers automatically. When invoking
+# `cargo build --target <triple>` directly, the NDK linker must be on PATH or
+# set here. Adjust the `NDK_HOME` toolchain version after running
+# `make android-setup` (Android NDK must be installed separately).
+
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android26-clang"
+
+[target.armv7-linux-androideabi]
+linker = "armv7a-linux-androideabi26-clang"
+
+[target.x86_64-linux-android]
+linker = "x86_64-linux-android26-clang"

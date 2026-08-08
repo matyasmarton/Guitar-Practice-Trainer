@@ -1,0 +1,39 @@
+[package]
+name = "guitar_trainer_core"
+description = "Real-time audio + pitch core for the all-fourths guitar practice trainer."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "guitar_trainer_core"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+tracing.workspace = true
+cpal = "0.17"
+rand = "0.8"
+rand_chacha = "0.3"
+toml = "0.8"
+enumset = { version = "1.1", features = ["serde"] }
+crossbeam-queue = "0.3"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+directories = "5"
+
+# UniFFI bindings (Kotlin/Swift). Re-enabled for the Android frontend.
+uniffi = { version = "0.28", optional = true, features = ["build", "bindgen"] }
+
+[features]
+default = []
+# Enables UniFFI exports for the Android (and iOS) frontends.
+uniffi = ["dep:uniffi", "uniffi/build"]
+
+[dev-dependencies]
+approx = "0.5"
+
+[build-dependencies]
+# Regenerate UniFFI skeleton bindings at build time when the feature is on.
+uniffi = { version = "0.28", optional = true }
