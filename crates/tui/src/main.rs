@@ -8,6 +8,7 @@
 //! The only exception is typing the timer seconds or a custom content path,
 //! which unavoidably need the keyboard — everything else is pure navigation.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -25,13 +26,34 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use scopeguard::defer;
+use tui_big_text::{BigText, PixelSize};
 
 use guitar_trainer_core::audio;
 use guitar_trainer_core::challenges::ChallengeType;
 use guitar_trainer_core::config::{Config, EnabledCategory};
 use guitar_trainer_core::engine::{Engine, EngineEvent, EngineListener};
+use guitar_trainer_core::note::Note;
 use guitar_trainer_core::theme::Theme;
 use guitar_trainer_core::tuning::TuningId;
+
+/// One completed prompt, kept for the Practice screen's "recent attempts"
+/// list (see `UiState::history`). Built purely from events the engine
+/// already streams — no `crates/core` changes.
+#[derive(Clone)]
+enum AttemptResult {
+    Passed,
+    TimedOut,
+}
+
+#[derive(Clone)]
+struct Attempt {
+    kind: String,
+    display: String,
+    result: AttemptResult,
+}
+
+/// Bound on `UiState::history` — "last ~8 prompts" per the redesign plan.
+const HISTORY_CAP: usize = 8;
 
 /// UI-facing snapshot derived from engine events + `engine.progress()`.
 #[derive(Default, Clone)]
@@ -58,6 +80,10 @@ struct UiState {
     cooldown_started: Option<std::time::Instant>,
     /// Duration of the current/most recent cooldown.
     cooldown_ms: u64,
+    /// Rolling window of recently completed prompts (pass/timeout), most
+    /// recent last. TUI-local bookkeeping for the Practice screen's Session
+    /// panel — capped at `HISTORY_CAP`.
+    history: VecDeque<Attempt>,
 }
 
 /// Channel-backed listener: the render loop drains `rx`.
@@ -224,6 +250,21 @@ fn drain_events(rx: &Receiver<EngineEvent>, ui: &mut UiState, engine: &Engine) {
     ui.prompt_secs = total;
 }
 
+/// Record a just-finished prompt into the rolling history, capped at
+/// `HISTORY_CAP`. Called from `apply_event` on `Passed`/`Timeout`, using the
+/// prompt kind/display already tracked on `ui` (still the just-completed
+/// prompt's — the next `Prompt` event hasn't landed yet).
+fn push_attempt(ui: &mut UiState, result: AttemptResult) {
+    ui.history.push_back(Attempt {
+        kind: ui.prompt_kind.clone(),
+        display: ui.prompt_display.clone(),
+        result,
+    });
+    while ui.history.len() > HISTORY_CAP {
+        ui.history.pop_front();
+    }
+}
+
 fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
     match ev {
         EngineEvent::Prompt(v) => {
@@ -241,12 +282,13 @@ fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
             }
             ui.matched = ui.matched_indices.iter().filter(|&&m| m).count();
         }
-        EngineEvent::Passed => {}
+        EngineEvent::Passed => push_attempt(ui, AttemptResult::Passed),
         EngineEvent::Cooldown { duration_ms } => {
             ui.cooldown_started = Some(std::time::Instant::now());
             ui.cooldown_ms = *duration_ms;
         }
         EngineEvent::Timeout => {
+            push_attempt(ui, AttemptResult::TimedOut);
             ui.matched = 0;
         }
         EngineEvent::Score { passed, total } => {
@@ -595,6 +637,135 @@ fn selection_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+// ---------------------------------------------------------------------------
+// Layout thresholds — every screen below chooses a wide (multi-column /
+// panel) or narrow (single-column) layout from these, and never leaves more
+// than the deliberate Fill-spacer remainder unclaimed at any size.
+// ---------------------------------------------------------------------------
+
+const WIDE_COLS: u16 = 140;
+const SHORT_ROWS: u16 = 30;
+
+fn is_wide(area: Rect) -> bool {
+    area.width >= WIDE_COLS
+}
+
+fn is_short(area: Rect) -> bool {
+    area.height < SHORT_ROWS
+}
+
+/// Dot-separated list of the currently enabled challenge categories, e.g.
+/// "Note · Chord · Scale". Shown on the Menu and Practice session panels so
+/// "what's enabled" is visible without opening Settings.
+fn category_chips(settings: &SettingsState) -> String {
+    let on: Vec<&str> = settings
+        .enabled
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(c, _)| c.label())
+        .collect();
+    if on.is_empty() {
+        "(none enabled)".to_string()
+    } else {
+        on.join(" · ")
+    }
+}
+
+/// Score / device / tuning / categories — the read-only session facts shown
+/// on both the Menu's "Last Session" card and the Practice screen's Session
+/// panel, built once so the two can never drift apart.
+fn session_summary_lines(ui: &UiState, settings: &SettingsState, theme: &Theme) -> Vec<Line<'static>> {
+    let device_name = settings
+        .audio_device
+        .clone()
+        .unwrap_or_else(|| "(default mic)".to_string());
+    let label_style = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default().fg(parse_color(&theme.secondary, Color::Cyan));
+    vec![
+        Line::from(vec![
+            Span::styled("Score      ", label_style),
+            Span::styled(format!("✓ {}/{}", ui.score_passed, ui.score_total), value_style),
+        ]),
+        Line::from(vec![Span::styled("Device     ", label_style), Span::raw(device_name)]),
+        Line::from(vec![
+            Span::styled("Tuning     ", label_style),
+            Span::raw(settings.tuning.label().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Categories ", label_style),
+            Span::raw(category_chips(settings)),
+        ]),
+    ]
+}
+
+/// The Practice screen's session panel: the summary above plus a rolling
+/// "recent attempts" list sourced from `ui.history`. Read-only and
+/// non-focusable — it never participates in `app.practice_idx`.
+/// `show_categories` is dropped in the compact (narrow-terminal) placement
+/// to leave more room for the attempts list.
+fn render_session_panel(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+    show_categories: bool,
+) {
+    let block = Block::default().borders(Borders::ALL).title(" Session ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut summary = session_summary_lines(ui, settings, theme);
+    if !show_categories {
+        summary.pop();
+    }
+    let summary_h = summary.len() as u16;
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(summary_h), Constraint::Length(1), Constraint::Fill(1)])
+        .split(inner);
+
+    f.render_widget(Paragraph::new(summary).wrap(Wrap { trim: true }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Recent",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )),
+        rows[1],
+    );
+
+    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
+    let danger_style = Style::default().fg(parse_color(&theme.danger, Color::Red));
+    if ui.history.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "No attempts yet this session.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            rows[2],
+        );
+    } else {
+        let items: Vec<ListItem> = ui
+            .history
+            .iter()
+            .rev()
+            .map(|a| {
+                let (mark, style) = match a.result {
+                    AttemptResult::Passed => ("✓", success_style),
+                    AttemptResult::TimedOut => ("⏱", danger_style),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{mark} "), style),
+                    Span::styled(format!("{:<11}", a.kind), Style::default().fg(Color::DarkGray)),
+                    Span::raw(a.display.clone()),
+                ]))
+            })
+            .collect();
+        f.render_widget(List::new(items), rows[2]);
+    }
+}
+
 fn draw_menu(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -605,13 +776,42 @@ fn draw_menu(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(3)])
+        .constraints([Constraint::Length(3), Constraint::Fill(1), Constraint::Length(3)])
         .split(area);
 
-    let title = Paragraph::new("Guitar Practice Trainer")
-        .alignment(Alignment::Center)
-        .style(Style::default().add_modifier(Modifier::BOLD));
-    f.render_widget(title, chunks[0]);
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Guitar Practice Trainer",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            settings.tuning.label().to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .alignment(Alignment::Center);
+    f.render_widget(header, chunks[0]);
+
+    let list_h = (MENU_ITEMS.len() as u16 + 2).min(chunks[1].height);
+    let wide = is_wide(area);
+
+    let (menu_area, card_area) = if wide {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Fill(1)])
+            .split(chunks[1]);
+        let menu_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Length(list_h), Constraint::Fill(1)])
+            .split(cols[0]);
+        (menu_rows[1], cols[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_h), Constraint::Fill(1)])
+            .split(chunks[1]);
+        (rows[0], rows[1])
+    };
 
     let items: Vec<ListItem> = MENU_ITEMS.iter().map(|s| ListItem::new(*s)).collect();
     let list = List::new(items)
@@ -624,7 +824,15 @@ fn draw_menu(
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.menu_idx));
-    f.render_stateful_widget(list, chunks[1], &mut state);
+    f.render_stateful_widget(list, menu_area, &mut state);
+
+    let card_block = Block::default().borders(Borders::ALL).title(" Last Session ");
+    let card_inner = card_block.inner(card_area);
+    f.render_widget(card_block, card_area);
+    f.render_widget(
+        Paragraph::new(session_summary_lines(ui, settings, theme)).wrap(Wrap { trim: true }),
+        card_inner,
+    );
 
     let device_name = settings
         .audio_device
@@ -643,31 +851,11 @@ fn draw_menu(
     f.render_widget(footer, chunks[2]);
 }
 
-fn draw_practice(
-    f: &mut ratatui::Frame<'_>,
-    area: Rect,
-    app: &App,
-    ui: &UiState,
-    settings: &SettingsState,
-    theme: &Theme,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    // Prompt block.
-    let prompt_block = Block::default().borders(Borders::ALL).title(Span::styled(
-        format!(" {} ", ui.prompt_kind),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
-    let targets_line: Line = if ui.ordered {
+/// Ordered checklist / set-completion line under the hero prompt (e.g.
+/// `[2/3]  E → G# → B` or `2  [✓E] [  G#] [  B]`), shared by every place
+/// that renders it.
+fn build_targets_line(ui: &UiState, success_style: Style) -> Line<'static> {
+    if ui.ordered {
         let mut spans = vec![Span::raw(format!("[{}/{}]  ", ui.matched, ui.targets.len()))];
         for (i, t) in ui.targets.iter().enumerate() {
             if i > 0 {
@@ -693,34 +881,194 @@ fn draw_practice(
             }
         }
         Line::from(spans)
-    };
-    let p = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(ui.prompt_display.clone()),
-        Line::from(""),
-        targets_line,
-    ])
-    .block(prompt_block)
-    .alignment(Alignment::Center)
-    .wrap(Wrap { trim: true });
-    f.render_widget(p, chunks[0]);
+    }
+}
 
-    // Timer (L) + detected note (R).
+/// How the current prompt name is rendered inside the hero panel: real
+/// big-glyph text (`tui-big-text`) when it fits the panel without
+/// truncation, otherwise a bold fallback with generous padding. Chosen per
+/// frame from the actual prompt string and the actual panel size — never
+/// forces oversized text into a column too narrow for it.
+enum PromptGlyph {
+    Big(PixelSize, u16),
+    Plain,
+}
+
+fn choose_prompt_glyph(text: &str, avail_w: u16, avail_h: u16) -> PromptGlyph {
+    let len = text.chars().count() as u16;
+    if len == 0 || avail_w == 0 {
+        return PromptGlyph::Plain;
+    }
+    // (pixel size, glyph cell width, glyph cell height); widest/tallest
+    // tier tried first. Reserve room below the glyph for a gap + the
+    // (possibly two-line) targets checklist.
+    const RESERVED_ROWS: u16 = 3;
+    let tiers: [(PixelSize, u16, u16); 2] = [(PixelSize::Full, 8, 8), (PixelSize::Quadrant, 4, 4)];
+    for (size, cw, ch) in tiers {
+        if len.saturating_mul(cw) <= avail_w && ch + RESERVED_ROWS <= avail_h {
+            return PromptGlyph::Big(size, ch);
+        }
+    }
+    PromptGlyph::Plain
+}
+
+/// Renders the current-prompt hero panel: kind title, a large legible
+/// rendering of the prompt name, and the target checklist below it.
+/// `area` is the whole panel including its border.
+fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        format!(" {} ", ui.prompt_kind),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
+    let targets = build_targets_line(ui, success_style);
+
+    let prompt_text = ui.prompt_display.trim();
+    let h_pad = inner.width.min(4);
+    let glyph = choose_prompt_glyph(prompt_text, inner.width.saturating_sub(h_pad), inner.height);
+
+    match glyph {
+        PromptGlyph::Big(size, rows) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Fill(1),
+                    Constraint::Length(rows),
+                    Constraint::Length(1),
+                    Constraint::Length(2),
+                    Constraint::Fill(1),
+                ])
+                .split(inner);
+            let big = BigText::builder()
+                .pixel_size(size)
+                .style(Style::default())
+                .centered()
+                .lines(vec![Line::from(prompt_text)])
+                .build();
+            f.render_widget(big, layout[1]);
+            f.render_widget(
+                Paragraph::new(targets).alignment(Alignment::Center).wrap(Wrap { trim: true }),
+                layout[3],
+            );
+        }
+        PromptGlyph::Plain => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(2),
+                    Constraint::Fill(1),
+                ])
+                .split(inner);
+            f.render_widget(
+                Paragraph::new(prompt_text)
+                    .alignment(Alignment::Center)
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                layout[1],
+            );
+            f.render_widget(
+                Paragraph::new(targets).alignment(Alignment::Center).wrap(Wrap { trim: true }),
+                layout[3],
+            );
+        }
+    }
+}
+
+/// Where the Session panel (or its collapsed fallback) lands on the
+/// Practice screen — depends on the wide/narrow/short thresholds below.
+enum SessionSlot {
+    Panel(Rect),
+    Line(Rect),
+}
+
+fn draw_practice(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
+    let wide = is_wide(area);
+
+    let (hero_area, timer_area, action_area, slot) = if wide {
+        // Wide: two columns — prompt/timer/actions on the left, a
+        // full-height Session panel (score, device, tuning, categories,
+        // recent attempts) on the right.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+            .split(area);
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Length(6), Constraint::Length(3)])
+            .split(cols[0]);
+        (left[0], left[1], left[2], SessionSlot::Panel(cols[1]))
+    } else if is_short(area) {
+        // Narrow AND short: no room for a panel — collapse to the single
+        // score/device line the screen has always shown here.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .split(area);
+        (rows[0], rows[1], rows[3], SessionSlot::Line(rows[2]))
+    } else {
+        // Narrow but tall enough: single column, with the Session panel
+        // (compact — no categories line) dropped beneath the action bar.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(3),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+        (rows[0], rows[1], rows[2], SessionSlot::Panel(rows[3]))
+    };
+
+    render_hero_prompt(f, hero_area, ui, theme);
+
+    // Timer (L) + detected note (R) — taller than the original fixed
+    // 3-row strip, with the content vertically centered inside, so both
+    // read at a glance from playing distance instead of hugging the top.
     let mid = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+        .split(timer_area);
+    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
+
     let gauge_color = if ui.time_left_secs <= 5 {
         parse_color(&theme.danger, Color::Red)
     } else {
         parse_color(&theme.success, Color::Green)
     };
+    let timer_block = Block::default().borders(Borders::ALL).title(" Timer ");
+    let timer_inner = timer_block.inner(mid[0]);
+    f.render_widget(timer_block, mid[0]);
+    let timer_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
+        .split(timer_inner);
     let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title(" Timer "))
         .gauge_style(Style::default().fg(gauge_color))
         .ratio(ui.time_left_frac)
-        .label(format!("{}s / {}s", ui.time_left_secs, ui.prompt_secs));
-    f.render_widget(gauge, mid[0]);
+        .label(Span::styled(
+            format!("{}s / {}s", ui.time_left_secs, ui.prompt_secs),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(gauge, timer_rows[1]);
+
     let detected_text = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
     // During the post-match cooldown, blink the Detected panel (alternating
     // reversed/success and plain accent styles every 200ms) as an obvious
@@ -740,23 +1088,17 @@ fn draw_practice(
     } else {
         accent_style
     };
-    let det = Paragraph::new(format!(" {}", detected_text))
-        .block(Block::default().borders(Borders::ALL).title(" Detected "))
-        .style(detected_style);
-    f.render_widget(det, mid[1]);
-
-    // Score + device line.
-    let device_name = settings
-        .audio_device
-        .clone()
-        .unwrap_or_else(|| "(default mic)".to_string());
-    let score_line = Paragraph::new(format!(
-        "✓ {}/{}   device: {}",
-        ui.score_passed, ui.score_total, device_name
-    ))
-    .alignment(Alignment::Center)
-    .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)));
-    f.render_widget(score_line, chunks[2]);
+    let detected_block = Block::default().borders(Borders::ALL).title(" Detected ");
+    let detected_inner = detected_block.inner(mid[1]);
+    f.render_widget(detected_block, mid[1]);
+    let detected_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
+        .split(detected_inner);
+    f.render_widget(
+        Paragraph::new(detected_text).alignment(Alignment::Center).style(detected_style),
+        detected_rows[1],
+    );
 
     // Footer action bar: Stop / Skip / Settings, current one highlighted.
     let mut spans = Vec::new();
@@ -777,15 +1119,50 @@ fn draw_practice(
                 .borders(Borders::ALL)
                 .title(" ←→ select, Enter to activate "),
         );
-    f.render_widget(footer, chunks[3]);
+    f.render_widget(footer, action_area);
+
+    match slot {
+        SessionSlot::Panel(rect) => render_session_panel(f, rect, ui, settings, theme, wide),
+        SessionSlot::Line(rect) => {
+            let device_name = settings
+                .audio_device
+                .clone()
+                .unwrap_or_else(|| "(default mic)".to_string());
+            let line = Paragraph::new(format!(
+                "✓ {}/{}   device: {}",
+                ui.score_passed, ui.score_total, device_name
+            ))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)));
+            f.render_widget(line, rect);
+        }
+    }
 }
 
 fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
-    let block = Block::default().borders(Borders::ALL).title(
+    let outer = Block::default().borders(Borders::ALL).title(
         " Settings — ↑↓ select, Enter to toggle/edit, Esc to save & back ",
     );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let list_h = (SETTINGS_ROW_COUNT as u16).min(inner.height);
+    let wide = is_wide(area);
+
+    // List stays top-aligned at its natural content height instead of
+    // stretching into the full remaining area — stretching a `List` doesn't
+    // fill it with anything, it just leaves blank rows below the last item.
+    let rows = if wide {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_h), Constraint::Length(1), Constraint::Fill(1)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_h), Constraint::Fill(1), Constraint::Length(1)])
+            .split(inner)
+    };
 
     let items: Vec<ListItem> = (0..SETTINGS_ROW_COUNT)
         .map(|i| ListItem::new(settings_row_label(i, app, settings)))
@@ -795,7 +1172,82 @@ fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &S
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.settings_idx));
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, rows[0], &mut state);
+
+    if wide {
+        let divider = "─".repeat(rows[1].width as usize);
+        f.render_widget(
+            Paragraph::new(Span::styled(divider, Style::default().fg(Color::DarkGray))),
+            rows[1],
+        );
+        render_settings_help(f, rows[2], app, settings, theme);
+    } else {
+        f.render_widget(
+            Paragraph::new("↑↓ select · Enter toggle/edit · Esc save & back")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+            rows[2],
+        );
+    }
+}
+
+/// One-line-to-paragraph contextual help for whichever Settings row is
+/// currently highlighted — fills the space the old fixed-height list left
+/// blank below its last item with something the highlighted row can
+/// actually use.
+fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+    let body = match app.settings_idx {
+        0 => "How long a prompt stays on screen before it times out. Longer gives more time to \
+              find every target note."
+            .to_string(),
+        1 => format!(
+            "Open strings, low → high: {}",
+            tuning_strings_label(settings.tuning)
+        ),
+        2 => "When ON, each new prompt draws uniformly at random from the enabled categories \
+              below, instead of cycling through them in order."
+            .to_string(),
+        3..=9 => {
+            let (c, _) = &settings.enabled[app.settings_idx - 3];
+            category_help(*c).to_string()
+        }
+        10 => format!(
+            "{} input device(s) found. Press Enter to rescan and choose one.",
+            app.devices.len()
+        ),
+        11 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
+              library. Leave empty to use only the built-in content."
+            .to_string(),
+        12 => "Save every change above and return to where you started.".to_string(),
+        _ => String::new(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(" About ");
+    let p = Paragraph::new(body)
+        .block(block)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)));
+    f.render_widget(p, area);
+}
+
+fn tuning_strings_label(tuning: TuningId) -> String {
+    tuning
+        .open_strings()
+        .iter()
+        .map(|&m| Note::from_midi_clamped(m).name())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn category_help(c: ChallengeType) -> &'static str {
+    match c {
+        ChallengeType::Note => "Single open or fretted notes — the fastest way to drill raw fretboard recall.",
+        ChallengeType::Chord => "A full chord voicing from a random root and quality; every note in the shape must sound.",
+        ChallengeType::Scale => "A scale run from a random root, matched in ascending order.",
+        ChallengeType::Mode => "A modal scale run from a random root, matched in ascending order.",
+        ChallengeType::Progression => "A chord-degree progression (e.g. I–IV–V) in a random key, matched in order.",
+        ChallengeType::Lick => "A short pre-written phrase from the content library, matched in order.",
+        ChallengeType::Piece => "An excerpt from a longer piece in the content library, matched in order.",
+    }
 }
 
 fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
@@ -857,10 +1309,20 @@ fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings:
         items.push(ListItem::new(label));
     }
 
+    // Top-align at natural content height + a `Fill` spacer below — same
+    // dead-space fix as Settings, no contextual help panel (nothing
+    // meaningfully contextual to show per-device beyond the name already
+    // visible).
+    let list_h = (items.len() as u16).min(inner.height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_h), Constraint::Fill(1)])
+        .split(inner);
+
     let list = List::new(items)
         .highlight_style(selection_style(theme))
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.device_idx));
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, rows[0], &mut state);
 }
