@@ -24,7 +24,6 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
-use tui_big_text::{BigText, PixelSize};
 use ratatui::Terminal;
 use scopeguard::defer;
 
@@ -697,9 +696,8 @@ fn is_short(area: Rect) -> bool {
 // fills its whole section directly, same as Heading's border does.
 // ---------------------------------------------------------------------------
 const HERO_TOP_MARGIN: u16 = 1;
-/// Always reserved, whether the prompt name renders as big glyphs or
-/// compact text — keeps the heading box's content height stable across
-/// prompts instead of jumping with name length.
+/// Reserved for the prompt name regardless of length, keeping the
+/// heading box's content height stable across prompts.
 const HERO_NAME_H: u16 = 4;
 const HERO_GAP1: u16 = 1;
 const HERO_CAPTION_H: u16 = 1;
@@ -937,13 +935,14 @@ fn center_v(rect: Rect, content_h: u16) -> Rect {
 
 /// The notes to actually play — the single most important piece of
 /// information during practice, and the hero panel's largest, boldest
-/// element. Each target is its own rounded bordered chip; the label renders
-/// as block-glyph big text (4 rows tall per note, ~4× the old single line)
-/// so it reads from playing distance — cyan border + cyan glyphs, turning
-/// green once matched. Ordered prompts chain the chips with an arrow so the
-/// required sequence reads left to right; unordered prompts space them
-/// evenly. If the big-text row would not fit the panel width (narrow
-/// terminal), it falls back to plain bold labels rather than clip.
+/// element. Each target is its own rounded bordered chip; the label
+/// renders as real terminal text — bold, letter-spaced, and colored —
+/// rather than block-glyph "big text": block-drawing pixel fonts read as
+/// chunky/retro no matter which resolution tier is picked, so weight and
+/// legibility now come from the type treatment (bold + spacing + color +
+/// the chip's own frame) instead of literal multi-row glyphs. Ordered
+/// prompts chain the chips with an arrow so the required sequence reads
+/// left to right; unordered prompts space them evenly.
 fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
         return;
@@ -951,33 +950,24 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
     let idle_border = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
     let idle_text = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
-    let plain_text = Style::default().add_modifier(Modifier::BOLD);
 
     let gap_w: u16 = if ui.ordered { 5 } else { 3 };
     let n = ui.targets.len() as u16;
-    // Quadrant pixel size renders each source character 4 cells wide and 4
-    // rows tall — big enough to fill the 9-row chip, small enough to keep
-    // the box at its previous size.
-    const BIG_COLS: u16 = 4;
-    const BIG_ROWS: u16 = 4;
-    let inner_h = area.height.saturating_sub(2);
 
-    // Big-text chips are preferred, but only when every chip fits the row;
-    // otherwise fall back to plain bold labels rather than clip or wrap.
-    let big_box_w = ui
+    // Letter-spaced label — the same crisp, real-font treatment used for
+    // the heading name — gives each note visual weight without resorting
+    // to a block-glyph pixel font.
+    let spaced = |t: &str| -> String { t.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
+    let labels: Vec<String> = ui
         .targets
         .iter()
-        .map(|t| t.chars().count() as u16 * BIG_COLS + 6) // glyphs + borders + 2-col slack
-        .max()
-        .unwrap_or(1);
-    let big_content_w = big_box_w * n + gap_w * n.saturating_sub(1);
-    let use_big = inner_h >= BIG_ROWS && big_content_w <= area.width;
-
-    let box_w = if use_big {
-        big_box_w
-    } else {
-        ui.targets.iter().map(|t| t.chars().count() as u16 + 6).max().unwrap_or(1)
-    };
+        .enumerate()
+        .map(|(i, t)| {
+            let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
+            if matched { format!("\u{2713} {}", spaced(t)) } else { spaced(t) }
+        })
+        .collect();
+    let box_w = labels.iter().map(|l| l.chars().count() as u16 + 6).max().unwrap_or(1);
     let content_w = (box_w * n + gap_w * n.saturating_sub(1)).min(area.width);
 
     let outer = Layout::default()
@@ -998,7 +988,7 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         .split(outer[1]);
 
     let mut ci = 0usize;
-    for (i, t) in ui.targets.iter().enumerate() {
+    for (i, label) in labels.iter().enumerate() {
         if i > 0 {
             if ui.ordered {
                 f.render_widget(
@@ -1011,34 +1001,17 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
         let rect = cells[ci];
         ci += 1;
-        let (border_style, text_style) = if matched {
-            (success, success)
-        } else {
-            (idle_border, idle_text)
-        };
+        let (border_style, text_style) = if matched { (success, success) } else { (idle_border, idle_text) };
         let chip = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border_style);
         let chip_inner = chip.inner(rect);
         f.render_widget(chip, rect);
-        if use_big {
-            let big = BigText::builder()
-                .pixel_size(PixelSize::Quadrant)
-                .style(text_style)
-                .centered()
-                .lines(vec![Line::from(t.clone())])
-                .build();
-            f.render_widget(big, center_v(chip_inner, BIG_ROWS));
-        } else {
-            // Plain fallback keeps the leading checkmark for matched notes
-            // (the ✓ glyph isn't in the 8x8 pixel font big text uses).
-            let label = if matched { format!("✓ {t}") } else { t.clone() };
-            f.render_widget(
-                Paragraph::new(label).alignment(Alignment::Center).style(plain_text),
-                center_v(chip_inner, 1),
-            );
-        }
+        f.render_widget(
+            Paragraph::new(label.clone()).alignment(Alignment::Center).style(text_style),
+            center_v(chip_inner, 1),
+        );
     }
 }
 
@@ -1069,12 +1042,15 @@ fn detected_correctness(ui: &UiState) -> Option<bool> {
 /// note is one of the still-needed targets, red when a note is heard but
 /// it isn't one of them, neutral while nothing is detected. During the
 /// post-match cooldown it keeps the existing blink cue (already-confirmed
-/// success) instead of the correctness color.
+/// success) instead of the correctness color. Renders as bold,
+/// letter-spaced real text — see `render_targets_row` for why block-glyph
+/// big text was dropped in favor of this crisper treatment.
 fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let text = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
+    let raw = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
+    let text: String = raw.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
     let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
     let danger = Style::default().fg(theme_color(&theme.danger, Color::Red)).add_modifier(Modifier::BOLD);
     let neutral = Style::default().add_modifier(Modifier::BOLD);
@@ -1103,44 +1079,20 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
         .title(" Detected ");
     let inner = block.inner(area);
     f.render_widget(block, area);
-
-    const BIG_COLS: u16 = 4;
-    const BIG_ROWS: u16 = 4;
-    // Only the actual note name (letters/digits/#) goes through the
-    // block-glyph font — the "—" idle placeholder has no glyph in it
-    // (same class of gap as the ✓ checkmark found earlier) and would
-    // silently render as a blank box instead of a dash.
-    let use_big = ui.detected_note.is_some()
-        && inner.height >= BIG_ROWS + 1
-        && (text.chars().count() as u16) * BIG_COLS <= inner.width;
-    if use_big {
-        let big = BigText::builder()
-            .pixel_size(PixelSize::Quadrant)
-            .style(text_style)
-            .centered()
-            .lines(vec![Line::from(text)])
-            .build();
-        f.render_widget(big, center_v(inner, BIG_ROWS));
-    } else {
-        f.render_widget(
-            Paragraph::new(text).alignment(Alignment::Center).style(text_style),
-            center_v(inner, 1),
-        );
-    }
+    f.render_widget(
+        Paragraph::new(text).alignment(Alignment::Center).style(text_style),
+        center_v(inner, 1),
+    );
 }
 
 /// The prompt name + match-count caption, boxed as its own bordered
 /// subsection — the sibling of the Notes chips and the Detected box, all
 /// three now spread evenly inside the hero panel (see `render_hero_prompt`).
-/// The prompt name renders as block-glyph big text when its row has the
-/// full 4 rows the glyph needs and the panel is wide enough to hold it
-/// without wrapping or clipping (a long Lick/Piece name degrades to
-/// compact letter-spaced text instead of overflowing); the match caption
-/// is always compact text — rendering it as big text only when the string
-/// was short enough previously made near-identical captions look
-/// different at every target count (a 1-target Note prompt vs. a
-/// 7-target Mode prompt's longer "— IN ORDER" string), which is a
-/// consistency bug, not a size choice.
+/// Both the name and the caption render as bold, letter-spaced real text —
+/// no block-glyph big text — so the type stays crisp and modern instead of
+/// reading as a pixelated retro LCD font; a long Lick/Piece name still
+/// degrades from letter-spaced to tight spacing if it wouldn't otherwise
+/// fit the box width.
 fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1176,32 +1128,12 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         .constraints([Constraint::Length(HERO_NAME_H), Constraint::Length(HERO_GAP1), Constraint::Length(HERO_CAPTION_H)])
         .split(content);
 
-    // Big-text glyphs are 4 terminal columns wide per source character —
-    // see `render_targets_row`/`render_detected_indicator` for the same
-    // measurement (PixelSize::Quadrant, U+2580-range Block Elements, safe
-    // on every monospace terminal font). Only worth it when the reserved
-    // name row actually kept its full 4-row height (i.e. wasn't clamped
-    // down by a cramped box) and the glyph fits the width.
-    const BIG_COLS_NAME: u16 = 4;
-    let name_big =
-        rows[0].height >= 4 && !name.is_empty() && (name.chars().count() as u16) * BIG_COLS_NAME <= content.width;
-
-    if name_big {
-        let big = BigText::builder()
-            .pixel_size(PixelSize::Quadrant)
-            .style(name_style)
-            .centered()
-            .lines(vec![Line::from(name.to_string())])
-            .build();
-        f.render_widget(big, rows[0]);
-    } else {
-        let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-        let name_text = if spaced.chars().count() as u16 <= content.width { spaced } else { name.to_string() };
-        f.render_widget(
-            Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
-            center_v(rows[0], 1),
-        );
-    }
+    let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+    let name_text = if spaced.chars().count() as u16 <= content.width { spaced } else { name.to_string() };
+    f.render_widget(
+        Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
+        center_v(rows[0], 1),
+    );
 
     f.render_widget(
         Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
