@@ -23,7 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
 use ratatui::Terminal;
 use tui_big_text::{BigText, PixelSize};
 use scopeguard::defer;
@@ -34,7 +34,7 @@ use guitar_trainer_core::config::{Config, EnabledCategory};
 use guitar_trainer_core::engine::{Engine, EngineEvent, EngineListener};
 use guitar_trainer_core::note::Note;
 use guitar_trainer_core::theme::Theme;
-use guitar_trainer_core::tuning::TuningId;
+use guitar_trainer_core::tuning::{string_note, TuningId, FRET_COUNT};
 
 /// One completed prompt, kept for the Practice screen's "recent attempts"
 /// list (see `UiState::history`). Built purely from events the engine
@@ -120,8 +120,8 @@ enum Edit {
 
 const MENU_ITEMS: [&str; 3] = ["Start Practice", "Settings", "Quit"];
 const PRACTICE_ACTIONS: [&str; 3] = ["Stop", "Skip", "Settings"];
-/// Settings rows: 0=Timer 1=Tuning 2=Random 3..=9=categories(7) 10=Audio Device 11=Custom Path 12=Back.
-const SETTINGS_ROW_COUNT: usize = 13;
+/// Settings rows: 0=Timer 1=Tuning 2=Fretboard highlight 3=Random 4..=10=categories(7) 11=Audio Device 12=Custom Path 13=Back.
+const SETTINGS_ROW_COUNT: usize = 14;
 
 struct App {
     screen: Screen,
@@ -314,6 +314,7 @@ struct SettingsState {
     tuning: TuningId,
     enabled: Vec<(ChallengeType, bool)>,
     random_mode: bool,
+    fretboard_highlight: bool,
     custom_path: String,
     audio_device: Option<String>,
     /// Not user-editable in this screen; preserved so saving other settings
@@ -336,6 +337,7 @@ impl SettingsState {
             tuning: cfg.tuning,
             enabled,
             random_mode: cfg.random_mode,
+            fretboard_highlight: cfg.fretboard_highlight,
             custom_path: cfg
                 .custom_content_path
                 .as_ref()
@@ -361,6 +363,7 @@ impl SettingsState {
             tuning: self.tuning,
             enabled: set,
             random_mode: self.random_mode,
+            fretboard_highlight: self.fretboard_highlight,
             custom_content_path: if self.custom_path.is_empty() {
                 None
             } else {
@@ -553,14 +556,15 @@ fn handle_settings_key(
                 let idx = TuningId::ALL.iter().position(|&t| t == settings.tuning).unwrap_or(0);
                 settings.tuning = TuningId::ALL[(idx + 1) % TuningId::ALL.len()];
             }
-            2 => settings.random_mode = !settings.random_mode,
-            3..=9 => {
-                let i = app.settings_idx - 3;
+            2 => settings.fretboard_highlight = !settings.fretboard_highlight,
+            3 => settings.random_mode = !settings.random_mode,
+            4..=10 => {
+                let i = app.settings_idx - 4;
                 if let Some(slot) = settings.enabled.get_mut(i) {
                     slot.1 = !slot.1;
                 }
             }
-            10 => {
+            11 => {
                 start_device_scan(app);
                 app.device_idx = settings
                     .audio_device
@@ -569,11 +573,11 @@ fn handle_settings_key(
                     .unwrap_or(0);
                 app.screen = Screen::DevicePick;
             }
-            11 => {
+            12 => {
                 app.edit = Edit::Path;
                 app.edit_buf = settings.custom_path.clone();
             }
-            12 => {
+            13 => {
                 apply_settings(settings, engine);
                 app.screen = if ui.running { Screen::Practice } else { Screen::Menu };
             }
@@ -1181,6 +1185,67 @@ fn detected_correctness(ui: &UiState) -> Option<bool> {
     }
 }
 
+/// The prompt's still-needed target note names, right now — mirrors
+/// `detected_correctness`'s ordered/unordered rule (only the *next* target
+/// counts when `ui.ordered`; every still-unmatched target counts otherwise)
+/// but returns the whole set instead of judging one detected note. Used by
+/// `render_fretboard` to highlight where those notes live on the board.
+fn active_target_names(ui: &UiState) -> Vec<&str> {
+    if ui.ordered {
+        ui.matched_indices
+            .iter()
+            .position(|m| !m)
+            .and_then(|i| ui.targets.get(i))
+            .map(|t| vec![t.as_str()])
+            .unwrap_or_default()
+    } else {
+        ui.targets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !ui.matched_indices.get(*i).copied().unwrap_or(false))
+            .map(|(_, t)| t.as_str())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod active_target_names_tests {
+    use super::*;
+
+    fn ui_with(targets: &[&str], matched: &[bool], ordered: bool) -> UiState {
+        UiState {
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            matched_indices: matched.to_vec(),
+            ordered,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unordered_returns_every_unmatched_target() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[false, true, false], false);
+        assert_eq!(active_target_names(&ui), vec!["A2", "C3"]);
+    }
+
+    #[test]
+    fn ordered_returns_only_the_next_target() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[true, false, false], true);
+        assert_eq!(active_target_names(&ui), vec!["B2"]);
+    }
+
+    #[test]
+    fn ordered_empty_once_every_target_is_matched() {
+        let ui = ui_with(&["A2", "B2"], &[true, true], true);
+        assert!(active_target_names(&ui).is_empty());
+    }
+
+    #[test]
+    fn unordered_empty_when_no_targets() {
+        let ui = ui_with(&[], &[], false);
+        assert!(active_target_names(&ui).is_empty());
+    }
+}
+
 /// What the mic currently hears — placed directly beneath the target-note
 /// chips (inside the hero panel), colored by correctness: green once the
 /// sounded note is one of the still-needed targets, red when a note is
@@ -1461,9 +1526,118 @@ mod detected_correctness_tests {
     }
 }
 
+/// Strips the trailing octave digit(s) from a `Note::name()` string, e.g.
+/// `"F#2" → "F#"`. Used for the fretboard's compact string-letter header;
+/// `Note` only exposes the combined name, no existing helper splits it.
+fn strip_octave(name: &str) -> &str {
+    name.trim_end_matches(|c: char| c.is_ascii_digit())
+}
+
+/// The selected tuning's fretboard — the wide/full-screen Practice
+/// layout's right column, lower 2/3 (see `draw_practice`). Nut at the top,
+/// frets increasing downward, strings low→high left→right: the standard
+/// vertical chord-chart orientation, as if the guitar were held upright
+/// facing the reader. Every cell's note comes straight from
+/// `guitar_trainer_core::tuning::string_note`, so it is always exactly
+/// what that tuning produces on that string/fret — no hand-maintained note
+/// table to drift out of sync when a tuning changes.
+///
+/// `settings.fretboard_highlight` selects the mode: off shows a plain
+/// static reference (every cell in `theme.secondary`); on colors/bolds the
+/// cells matching `active_target_names(ui)` (the current prompt's
+/// still-needed target notes) in `theme.accent`, clearing automatically as
+/// `ui` advances prompt to prompt.
+fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settings: &SettingsState, theme: &Theme) {
+    let tuning = settings.tuning;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
+        .title(format!(" Fretboard — {} ", tuning.label()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Position-marker frets, same convention real fretboards use (no
+    // functional meaning) — a light accuracy/polish touch since this is
+    // meant to read as an actual guitar fretboard. FRET_COUNT (22) stops
+    // short of the second double-dot fret (24) a 24-fret board would have.
+    const FRET_MARKERS: [u8; 8] = [3, 5, 7, 9, 15, 17, 19, 21];
+    const FRET_DOUBLE_MARKER: u8 = 12;
+    const GUTTER_W: u16 = 4; // fits "12●●"
+    const STRING_COL_W: u16 = 4; // fits "A#2 "
+    let table_width = GUTTER_W + STRING_COL_W * 6;
+
+    // 1 header row (string letters) + as many fret rows as fit, starting
+    // from the open strings (fret 0) — never more than FRET_COUNT frets.
+    let available_fret_rows = inner.height.saturating_sub(1);
+    let frets_shown = available_fret_rows.min(FRET_COUNT as u16 + 1);
+    if frets_shown == 0 {
+        return; // too short even for one fret row — block/title still drew.
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(table_width.min(inner.width)),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    let header_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    let open_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
+    let note_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
+    let gutter_style = Style::default().fg(Color::DarkGray);
+    let highlight_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
+
+    let active = if settings.fretboard_highlight {
+        active_target_names(ui)
+    } else {
+        Vec::new()
+    };
+
+    let header = Row::new(std::iter::once(Cell::from("Fr")).chain(tuning.open_strings().iter().map(|&m| {
+        let name = Note::from_midi_clamped(m).name();
+        Cell::from(strip_octave(&name).to_string())
+    })))
+    .style(header_style);
+
+    let rows: Vec<Row> = (0..frets_shown as u8)
+        .map(|fret| {
+            let marker = if fret == FRET_DOUBLE_MARKER {
+                "●●"
+            } else if FRET_MARKERS.contains(&fret) {
+                "●"
+            } else {
+                ""
+            };
+            let row_style = if fret == 0 { open_style } else { note_style };
+            let gutter = Cell::from(format!("{fret}{marker}")).style(gutter_style);
+            let string_cells = (0..6usize).map(|s| {
+                let name = string_note(tuning, s, fret).map(|n| n.name()).unwrap_or_else(|| "-".to_string());
+                let cell_style = if active.contains(&name.as_str()) { highlight_style } else { row_style };
+                Cell::from(name).style(cell_style)
+            });
+            Row::new(std::iter::once(gutter).chain(string_cells))
+        })
+        .collect();
+
+    let widths: Vec<Constraint> = std::iter::once(Constraint::Length(GUTTER_W))
+        .chain(std::iter::repeat(Constraint::Length(STRING_COL_W)).take(6))
+        .collect();
+    let table = Table::new(rows, widths).header(header);
+    f.render_widget(table, cols[1]);
+}
+
 /// Where the Session panel (or its collapsed fallback) lands on the
 /// Practice screen — depends on the wide/narrow/short thresholds below.
 enum SessionSlot {
+    /// Wide/full-screen layout only: right column split into Session
+    /// (top 1/3) + Fretboard (bottom 2/3) — see `draw_practice`'s match.
+    WidePanel(Rect),
     Panel(Rect),
     Line(Rect),
 }
@@ -1494,7 +1668,7 @@ fn draw_practice(
             .direction(Direction::Vertical)
             .constraints([Constraint::Fill(1), Constraint::Length(6), Constraint::Length(3)])
             .split(cols[0]);
-        (left[0], left[1], left[2], SessionSlot::Panel(cols[1]))
+        (left[0], left[1], left[2], SessionSlot::WidePanel(cols[1]))
     } else if is_short(area) {
         // Narrow AND short: no room for a panel — collapse to the single
         // score/device line the screen has always shown here. Terminal is
@@ -1591,6 +1765,14 @@ fn draw_practice(
     f.render_widget(footer, action_area);
 
     match slot {
+        SessionSlot::WidePanel(rect) => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+                .split(rect);
+            render_session_panel(f, rows[0], ui, settings, theme, wide);
+            render_fretboard(f, rows[1], ui, settings, theme);
+        }
         SessionSlot::Panel(rect) => render_session_panel(f, rect, ui, settings, theme, wide),
         SessionSlot::Line(rect) => {
             let device_name = settings
@@ -1674,21 +1856,25 @@ fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, setti
             "Open strings, low → high: {}",
             tuning_strings_label(settings.tuning)
         ),
-        2 => "When ON, each new prompt draws uniformly at random from the enabled categories \
+        2 => "When ON, the Fretboard panel (visible in the full-screen Practice layout) \
+              highlights the current prompt's still-needed target note(s) live instead of \
+              showing every note as a static reference."
+            .to_string(),
+        3 => "When ON, each new prompt draws uniformly at random from the enabled categories \
               below, instead of cycling through them in order."
             .to_string(),
-        3..=9 => {
-            let (c, _) = &settings.enabled[app.settings_idx - 3];
+        4..=10 => {
+            let (c, _) = &settings.enabled[app.settings_idx - 4];
             category_help(*c).to_string()
         }
-        10 => format!(
+        11 => format!(
             "{} input device(s) found. Press Enter to rescan and choose one.",
             app.devices.len()
         ),
-        11 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
+        12 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
               library. Leave empty to use only the built-in content."
             .to_string(),
-        12 => "Save every change above and return to where you started.".to_string(),
+        13 => "Save every change above and return to where you started.".to_string(),
         _ => String::new(),
     };
     let block = Block::default()
@@ -1733,16 +1919,20 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
             }
         }
         1 => format!("Tuning: {}", settings.tuning.label()),
-        2 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
-        3..=9 => {
-            let (c, on) = &settings.enabled[i - 3];
+        2 => format!(
+            "Fretboard highlight: {}",
+            if settings.fretboard_highlight { "ON" } else { "off" }
+        ),
+        3 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
+        4..=10 => {
+            let (c, on) = &settings.enabled[i - 4];
             format!("[{}] {}", if *on { "✓" } else { " " }, c.label())
         }
-        10 => format!(
+        11 => format!(
             "Audio device: {}",
             settings.audio_device.clone().unwrap_or_else(|| "(default mic)".to_string())
         ),
-        11 => {
+        12 => {
             if app.edit == Edit::Path {
                 format!("Custom content path: {}█", app.edit_buf)
             } else {
@@ -1754,7 +1944,7 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
                 format!("Custom content path: {p}")
             }
         }
-        12 => "← Back (save & return)".to_string(),
+        13 => "← Back (save & return)".to_string(),
         _ => String::new(),
     }
 }
