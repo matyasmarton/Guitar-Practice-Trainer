@@ -685,6 +685,37 @@ fn is_short(area: Rect) -> bool {
     area.height < SHORT_ROWS
 }
 
+// ---------------------------------------------------------------------------
+// Hero panel content budget — shared between `draw_practice` (which sizes
+// the panel's outer `Rect` to fit exactly this much, so leftover screen
+// height becomes an ordinary spacer between cards instead of dead space
+// trapped inside the border) and `render_hero_prompt` (which lays out its
+// rows to this same budget). Keeping one source of truth means the two
+// can never drift apart.
+// ---------------------------------------------------------------------------
+const HERO_TOP_MARGIN: u16 = 1;
+/// Always reserved, whether the prompt name renders as big glyphs or
+/// compact text — keeps the panel's height (and every row below it)
+/// stable across prompts instead of jumping with name length.
+const HERO_NAME_H: u16 = 4;
+const HERO_GAP1: u16 = 1;
+const HERO_CAPTION_H: u16 = 1;
+const HERO_GAP2: u16 = 2;
+const HERO_CHIP_H: u16 = 9;
+const HERO_GAP3: u16 = 1;
+const HERO_DETECTED_H: u16 = 7;
+const HERO_BOTTOM_MARGIN: u16 = 1;
+const HERO_CONTENT_H: u16 = 2 // borders
+    + HERO_TOP_MARGIN
+    + HERO_NAME_H
+    + HERO_GAP1
+    + HERO_CAPTION_H
+    + HERO_GAP2
+    + HERO_CHIP_H
+    + HERO_GAP3
+    + HERO_DETECTED_H
+    + HERO_BOTTOM_MARGIN;
+
 /// Dot-separated list of the currently enabled challenge categories, e.g.
 /// "Note · Chord · Scale". Shown on the Menu and Practice session panels so
 /// "what's enabled" is visible without opening Settings.
@@ -1008,20 +1039,109 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     }
 }
 
+/// True if the currently detected note is one of the prompt's still-needed
+/// targets — `None` when nothing is detected right now. For ordered
+/// prompts only the *next* required target counts (matching
+/// `crates/core::engine::required_target_midi`'s rule); for unordered
+/// prompts any remaining target counts. This is a TUI-local comparison
+/// over note *names* — `EngineEvent::DetectedNote` and
+/// `ChallengeView::targets` both come from the same `Note::name()`
+/// formatter in `crates/core`, so string equality is exact and no core
+/// change is needed.
+fn detected_correctness(ui: &UiState) -> Option<bool> {
+    let note = ui.detected_note.as_deref()?;
+    if ui.ordered {
+        let next = ui.matched_indices.iter().position(|m| !m)?;
+        Some(ui.targets.get(next).map(String::as_str) == Some(note))
+    } else {
+        Some(ui.targets.iter().enumerate().any(|(i, t)| {
+            !ui.matched_indices.get(i).copied().unwrap_or(false) && t == note
+        }))
+    }
+}
+
+/// What the mic currently hears — placed directly beneath the target-note
+/// chips (inside the hero panel) rather than squeezed into half of a row
+/// beside the Timer, and colored by correctness: green once the sounded
+/// note is one of the still-needed targets, red when a note is heard but
+/// it isn't one of them, neutral while nothing is detected. During the
+/// post-match cooldown it keeps the existing blink cue (already-confirmed
+/// success) instead of the correctness color.
+fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let text = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
+    let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
+    let danger = Style::default().fg(theme_color(&theme.danger, Color::Red)).add_modifier(Modifier::BOLD);
+    let neutral = Style::default().add_modifier(Modifier::BOLD);
+    let idle_border = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
+
+    let cooldown_active = ui
+        .cooldown_started
+        .map(|t| t.elapsed() < Duration::from_millis(ui.cooldown_ms))
+        .unwrap_or(false);
+    let (text_style, border_style) = if cooldown_active {
+        let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200) % 2 == 0;
+        let s = if blink_on { success.add_modifier(Modifier::REVERSED) } else { success };
+        (s, success)
+    } else {
+        match detected_correctness(ui) {
+            Some(true) => (success, success),
+            Some(false) => (danger, danger),
+            None => (neutral, idle_border),
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(" Detected ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    const BIG_COLS: u16 = 4;
+    const BIG_ROWS: u16 = 4;
+    // Only the actual note name (letters/digits/#) goes through the
+    // block-glyph font — the "—" idle placeholder has no glyph in it
+    // (same class of gap as the ✓ checkmark found earlier) and would
+    // silently render as a blank box instead of a dash.
+    let use_big = ui.detected_note.is_some()
+        && inner.height >= BIG_ROWS + 1
+        && (text.chars().count() as u16) * BIG_COLS <= inner.width;
+    if use_big {
+        let big = BigText::builder()
+            .pixel_size(PixelSize::Quadrant)
+            .style(text_style)
+            .centered()
+            .lines(vec![Line::from(text)])
+            .build();
+        f.render_widget(big, center_v(inner, BIG_ROWS));
+    } else {
+        f.render_widget(
+            Paragraph::new(text).alignment(Alignment::Center).style(text_style),
+            center_v(inner, 1),
+        );
+    }
+}
+
 /// Renders the current-prompt hero panel: kind title (small, in the
-/// border), then the prompt name, match caption, and target-note chips
-/// grouped into one tightly-spaced block and centered together in the
-/// panel — keeping the name and the notes to play visually adjacent
-/// instead of pinning the name near the top with the chips centered far
-/// below it. The prompt name and match caption render as block-glyph big
-/// text (the same font the target chips use) whenever the panel has
-/// enough width and height to hold them without wrapping or clipping;
-/// otherwise each falls back independently to compact single-row text —
-/// a long Lick/Piece name (which can run 30+ characters with a note list
-/// in parentheses) degrades gracefully instead of overflowing. The
-/// target notes stay the panel's most heavily framed element (bordered,
-/// checkmarked chip boxes) even when the heading reaches the same glyph
-/// height, since those are what the player has to act on.
+/// border), then the prompt name, match caption, target-note chips, and
+/// the Detected indicator, in that top-to-bottom reading order with a
+/// small fixed margin under the border. Previously this content was
+/// vertically *centered* as one block, which on a tall full-screen
+/// terminal left a large dead gap above the heading — the most-reported
+/// issue. Any true leftover height now trails below the group as ordinary
+/// bottom padding instead of floating the heading mid-panel. The prompt
+/// name renders as block-glyph big text when the panel has enough width
+/// and height to hold it without wrapping or clipping (a long Lick/Piece
+/// name degrades to compact letter-spaced text instead of overflowing);
+/// the match caption is always compact text — rendering it as big text
+/// only when the string was short enough previously made near-identical
+/// captions look different at every target count (a 1-target Note prompt
+/// vs. a 7-target Mode prompt's longer "— IN ORDER" string), which is a
+/// consistency bug, not a size choice.
 fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1042,68 +1162,49 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     };
     // Heading: accent yellow — the first colored thing the eye lands on.
     let name_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
-    // Subheading: cyan by default, switching to green once progress starts
-    // — never a flat white line.
+    // Subheading: cyan by default, switching to green once progress starts.
     let caption_style = if ui.matched > 0 {
         Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
     };
 
-    // Big-text glyphs are 4 terminal columns wide per source character no
-    // matter the row height (Quadrant and Sextant both halve the 8-col
-    // font horizontally) — only the row count differs. Each string is
-    // measured independently against the panel width, so e.g. a short
-    // chord name renders big while a long Lick name with a note list
-    // falls back to plain text on its own, never wrapping or clipping.
-    // Big-text glyphs render via ratatui's plain Block Elements (U+2580
-    // range) at Quadrant/HalfHeight — supported by every monospace
-    // terminal font. Sextant/ThirdHeight instead depend on the newer
-    // Legacy Computing Symbols block (U+1FB00+), which most terminal
-    // fonts (including macOS Terminal.app's defaults) ship no glyphs
-    // for — that combination is what rendered the subheading as
-    // unreadable tofu/`?`-box placeholders, so neither is used here.
-    const BIG_COLS_NAME: u16 = 4; // PixelSize::Quadrant — 2 source px per cell horizontally.
-    const NAME_BIG_ROWS: u16 = 4;
-    const BIG_COLS_CAPTION: u16 = 8; // PixelSize::HalfHeight — 1 source px per cell horizontally.
-    const CAPTION_BIG_ROWS: u16 = 4;
-    // Below this inner height there isn't reliably room for a 4-row
-    // heading plus a 4-row subheading above the chip row's 5-row floor
-    // and its own gaps; fall back to compact text rather than risk the
-    // group overflowing the panel on a short terminal.
-    const MIN_BIG_TEXT_INNER_H: u16 = 24;
-    let fits_big = |s: &str, cols_per_char: u16| -> bool {
-        !s.is_empty() && (s.chars().count() as u16) * cols_per_char <= inner.width
-    };
+    // Big-text glyphs are 4 terminal columns wide per source character —
+    // see `render_targets_row`/`render_detected_indicator` for the same
+    // measurement (PixelSize::Quadrant, U+2580-range Block Elements, safe
+    // on every monospace terminal font).
+    const BIG_COLS_NAME: u16 = 4;
+    const MIN_BIG_TEXT_INNER_H: u16 = 20;
     let allow_big = inner.height >= MIN_BIG_TEXT_INNER_H;
-    let name_big = allow_big && fits_big(name, BIG_COLS_NAME);
-    let caption_big = allow_big && fits_big(&caption, BIG_COLS_CAPTION);
+    let name_big = allow_big && !name.is_empty() && (name.chars().count() as u16) * BIG_COLS_NAME <= inner.width;
 
-    // Size the chip row last so the name + caption + chips group can be
-    // measured as a single block and centered together, rather than
-    // pinning the name to the top and centering the chips separately in
-    // whatever space is left over. Gap above the chips is wider than the
-    // gap between name and caption, so the heading cluster reads clearly
-    // above the notes without crowding them.
-    let name_h: u16 = if name_big { NAME_BIG_ROWS } else { 1 };
-    let gap_above_caption: u16 = 1;
-    let caption_h: u16 = if caption_big { CAPTION_BIG_ROWS } else { 1 };
-    let gap_above_chips: u16 = 4;
-    let fixed_h = name_h + gap_above_caption + caption_h + gap_above_chips;
-    let box_h = inner.height.saturating_sub(fixed_h).clamp(5, 9);
-    let content_h = fixed_h + box_h;
+    // Sized to the shared `HERO_*` budget (see its definition) rather than
+    // stretched to whatever's left — `draw_practice` now sizes this panel's
+    // outer `Rect` to that same budget, so `inner.height` is normally an
+    // exact fit; the clamps below only kick in as a graceful shrink on a
+    // genuinely cramped terminal. The name row is always reserved at its
+    // full height (whether big-glyph or compact text renders inside it) so
+    // the panel's height never jumps between a short and a long prompt name.
+    let fixed_h =
+        HERO_TOP_MARGIN + HERO_NAME_H + HERO_GAP1 + HERO_CAPTION_H + HERO_GAP2;
+    let remaining = inner.height.saturating_sub(fixed_h + HERO_GAP3);
+    let chip_h = remaining.saturating_sub(HERO_DETECTED_H).clamp(5, HERO_CHIP_H);
+    let detected_h = remaining.saturating_sub(chip_h).clamp(5, HERO_DETECTED_H);
 
-    let group = center_v(inner, content_h);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(name_h),
-            Constraint::Length(gap_above_caption),
-            Constraint::Length(caption_h),
-            Constraint::Length(gap_above_chips),
-            Constraint::Length(box_h),
+            Constraint::Length(HERO_TOP_MARGIN),
+            Constraint::Length(HERO_NAME_H),
+            Constraint::Length(HERO_GAP1),
+            Constraint::Length(HERO_CAPTION_H),
+            Constraint::Length(HERO_GAP2),
+            Constraint::Length(chip_h),
+            Constraint::Length(HERO_GAP3),
+            Constraint::Length(detected_h),
+            Constraint::Fill(1),
         ])
-        .split(group);
+        .split(inner);
 
     if name_big {
         let big = BigText::builder()
@@ -1112,34 +1213,72 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
             .centered()
             .lines(vec![Line::from(name.to_string())])
             .build();
-        f.render_widget(big, layout[0]);
+        f.render_widget(big, layout[1]);
     } else {
-        // Falls back to unspaced text rather than clip if the letter-spaced
-        // version wouldn't fit the panel.
         let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
         let name_text = if spaced.chars().count() as u16 <= inner.width { spaced } else { name.to_string() };
         f.render_widget(
             Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
-            center_v(layout[0], 1),
+            center_v(layout[1], 1),
         );
     }
 
-    if caption_big {
-        let big = BigText::builder()
-            .pixel_size(PixelSize::HalfHeight)
-            .style(caption_style)
-            .centered()
-            .lines(vec![Line::from(caption.clone())])
-            .build();
-        f.render_widget(big, layout[2]);
-    } else {
-        f.render_widget(
-            Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
-            center_v(layout[2], 1),
-        );
+    f.render_widget(
+        Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
+        center_v(layout[3], 1),
+    );
+
+    render_targets_row(f, layout[5], ui, theme);
+    render_detected_indicator(f, layout[7], ui, theme);
+}
+
+#[cfg(test)]
+mod detected_correctness_tests {
+    use super::*;
+
+    fn ui_with(targets: &[&str], matched: &[bool], ordered: bool, detected: Option<&str>) -> UiState {
+        UiState {
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            matched_indices: matched.to_vec(),
+            ordered,
+            detected_note: detected.map(String::from),
+            ..Default::default()
+        }
     }
 
-    render_targets_row(f, layout[4], ui, theme);
+    #[test]
+    fn unordered_correct_when_any_unmatched_target_sounds() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[false, true, false], false, Some("C3"));
+        assert_eq!(detected_correctness(&ui), Some(true));
+    }
+
+    #[test]
+    fn unordered_wrong_when_note_is_not_a_target() {
+        let ui = ui_with(&["A2", "B2"], &[false, false], false, Some("D3"));
+        assert_eq!(detected_correctness(&ui), Some(false));
+    }
+
+    #[test]
+    fn unordered_wrong_when_note_is_an_already_matched_target() {
+        // A2 was already accepted; hearing it again isn't "still needed".
+        let ui = ui_with(&["A2", "B2"], &[true, false], false, Some("A2"));
+        assert_eq!(detected_correctness(&ui), Some(false));
+    }
+
+    #[test]
+    fn ordered_only_the_next_target_counts() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[true, false, false], true, Some("C3"));
+        // next required is B2 (index 1); C3 is a target but out of order.
+        assert_eq!(detected_correctness(&ui), Some(false));
+        let ui2 = ui_with(&["A2", "B2", "C3"], &[true, false, false], true, Some("B2"));
+        assert_eq!(detected_correctness(&ui2), Some(true));
+    }
+
+    #[test]
+    fn none_when_nothing_detected() {
+        let ui = ui_with(&["A2"], &[false], false, None);
+        assert_eq!(detected_correctness(&ui), None);
+    }
 }
 
 /// Where the Session panel (or its collapsed fallback) lands on the
@@ -1162,19 +1301,33 @@ fn draw_practice(
     let (hero_area, timer_area, action_area, slot) = if wide {
         // Wide: two columns — prompt/timer/actions on the left, a
         // full-height Session panel (score, device, tuning, categories,
-        // recent attempts) on the right.
+        // recent attempts) on the right. Hero is sized to its actual
+        // content (`HERO_CONTENT_H`, shared with `render_hero_prompt`)
+        // rather than stretched to fill the column — on a tall terminal
+        // that stretch previously either centered the heading in a huge
+        // gap or, after top-anchoring, stranded a large dead zone below
+        // it. Leftover height now becomes an ordinary spacer between the
+        // hero card and the Timer, same as the whitespace between any two
+        // dashboard cards.
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
             .split(area);
         let left = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(6), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(HERO_CONTENT_H),
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(3),
+            ])
             .split(cols[0]);
-        (left[0], left[1], left[2], SessionSlot::Panel(cols[1]))
+        (left[0], left[2], left[3], SessionSlot::Panel(cols[1]))
     } else if is_short(area) {
         // Narrow AND short: no room for a panel — collapse to the single
-        // score/device line the screen has always shown here.
+        // score/device line the screen has always shown here. Terminal is
+        // already tight, so hero keeps claiming whatever's left rather
+        // than a fixed budget that might not fit.
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1188,29 +1341,27 @@ fn draw_practice(
     } else {
         // Narrow but tall enough: single column, with the Session panel
         // (compact — no categories line) dropped beneath the action bar.
+        // Leftover height flows into the Session panel (more room for its
+        // recent-attempts list) instead of sitting idle inside the hero
+        // panel.
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Fill(1),
+                Constraint::Length(HERO_CONTENT_H),
+                Constraint::Length(1),
                 Constraint::Length(6),
                 Constraint::Length(3),
                 Constraint::Fill(1),
             ])
             .split(area);
-        (rows[0], rows[1], rows[2], SessionSlot::Panel(rows[3]))
+        (rows[0], rows[2], rows[3], SessionSlot::Panel(rows[4]))
     };
 
     render_hero_prompt(f, hero_area, ui, theme);
 
-    // Timer (L) + detected note (R) — taller than the original fixed
-    // 3-row strip, with the content vertically centered inside, so both
-    // read at a glance from playing distance instead of hugging the top.
-    let mid = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(timer_area);
-    let success_style = Style::default().fg(theme_color(&theme.success, Color::Green));
-
+    // Timer — full width. The Detected indicator now lives directly under
+    // the target-note chips inside the hero panel (see
+    // `render_detected_indicator`), not squeezed into half of this row.
     let gauge_color = if ui.time_left_secs <= 5 {
         theme_color(&theme.danger, Color::Red)
     } else {
@@ -1221,8 +1372,8 @@ fn draw_practice(
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
         .title(" Timer ");
-    let timer_inner = timer_block.inner(mid[0]);
-    f.render_widget(timer_block, mid[0]);
+    let timer_inner = timer_block.inner(timer_area);
+    f.render_widget(timer_block, timer_area);
     let timer_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
@@ -1235,41 +1386,6 @@ fn draw_practice(
             Style::default().add_modifier(Modifier::BOLD),
         ));
     f.render_widget(gauge, timer_rows[1]);
-
-    let detected_text = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
-    // During the post-match cooldown, blink the Detected panel (alternating
-    // reversed/success and plain accent styles every 200ms) as an obvious
-    // "matched, hold on" cue; otherwise render with the plain accent style.
-    let accent_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
-    let cooldown_active = ui
-        .cooldown_started
-        .map(|t| t.elapsed() < Duration::from_millis(ui.cooldown_ms))
-        .unwrap_or(false);
-    let detected_style = if cooldown_active {
-        let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200) % 2 == 0;
-        if blink_on {
-            success_style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            accent_style
-        }
-    } else {
-        accent_style
-    };
-    let detected_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
-        .title(" Detected ");
-    let detected_inner = detected_block.inner(mid[1]);
-    f.render_widget(detected_block, mid[1]);
-    let detected_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
-        .split(detected_inner);
-    f.render_widget(
-        Paragraph::new(detected_text).alignment(Alignment::Center).style(detected_style),
-        detected_rows[1],
-    );
 
     // Footer action bar: Stop / Skip / Settings. The highlighted action
     // gets a filled background pill plus a "‣ " marker and underline (the
