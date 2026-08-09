@@ -61,6 +61,36 @@ impl Default for TuningId {
     }
 }
 
+/// A concrete set of six open-string MIDI notes plus a display label: what
+/// every fret-arithmetic/UI function actually needs, whether the tuning is
+/// one of the three built-ins ([`TuningId`]) or a user-defined tuning (see
+/// `crate::custom_tuning`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    pub label: String,
+    pub open_strings: [u8; 6],
+}
+
+impl Tuning {
+    pub fn builtin(id: TuningId) -> Self {
+        Tuning { label: id.label().to_string(), open_strings: id.open_strings() }
+    }
+
+    /// Same "lowest open string .. highest string fretted to FRET_COUNT" math
+    /// as `TuningId::range`, generalized to any six open strings.
+    pub fn range(&self) -> RangeInclusive<u8> {
+        midi_range_for_strings(self.open_strings)
+    }
+
+    pub fn string_midi(&self, string: usize, fret: u8) -> Option<u8> {
+        midi_for_strings(self.open_strings, string, fret)
+    }
+
+    pub fn string_note(&self, string: usize, fret: u8) -> Option<Note> {
+        self.string_midi(string, fret).and_then(Note::from_midi)
+    }
+}
+
 /// Number of frets on the instrument (22-fret default).
 pub const FRET_COUNT: u8 = 22;
 
@@ -69,21 +99,34 @@ pub const FRET_COUNT: u8 = 22;
 /// Returns `None` when the string index is invalid or the resulting note would
 /// exceed the playable range `MIDI_MIN..=MIDI_MAX`.
 pub fn string_midi(tuning: TuningId, string: usize, fret: u8) -> Option<u8> {
-    let open = tuning.open_strings().get(string).copied()?;
+    midi_for_strings(tuning.open_strings(), string, fret)
+}
+
+/// Like [`string_midi`] but returns a [`Note`].
+pub fn string_note(tuning: TuningId, string: usize, fret: u8) -> Option<Note> {
+    string_midi(tuning, string, fret).and_then(Note::from_midi)
+}
+
+/// Shared by `string_midi` (built-ins) and `Tuning::string_midi` (built-ins +
+/// custom): MIDI note produced by `fret`ting `string` (0 = open) given six
+/// open-string MIDI notes. `None` if the string index is invalid or the
+/// result exceeds `MIDI_MAX` / `FRET_COUNT`.
+fn midi_for_strings(open_strings: [u8; 6], string: usize, fret: u8) -> Option<u8> {
+    let open = open_strings.get(string).copied()?;
     let midi = open.saturating_add(fret);
     if midi > MIDI_MAX {
         return None;
     }
-    // A 22-fret board cannot exceed this; defensive clamp.
     if fret > FRET_COUNT {
         return None;
     }
     Some(midi)
 }
 
-/// Like [`string_midi`] but returns a [`Note`].
-pub fn string_note(tuning: TuningId, string: usize, fret: u8) -> Option<Note> {
-    string_midi(tuning, string, fret).and_then(Note::from_midi)
+fn midi_range_for_strings(open_strings: [u8; 6]) -> RangeInclusive<u8> {
+    let lo = open_strings[0];
+    let hi = open_strings[5].saturating_add(FRET_COUNT);
+    lo..=hi
 }
 
 #[cfg(test)]
