@@ -49,6 +49,47 @@ adjacent strings ≤22 frets apart; every note across the full 22-fret board
 must fall within the app's supported D2..F6 range. Whichever tuning is
 active drives prompt generation *and* the live fretboard visualizer.
 
+## Practice modes
+
+Seven prompt categories, toggled independently in Settings (at least one
+must stay enabled — an empty set falls back to all 7):
+
+| Mode | What it asks for |
+|---|---|
+| **Note** | A single open or fretted note — the fastest way to drill raw fretboard recall. |
+| **Chord** | A full chord voicing from a random root + quality; every note in the shape must sound (order doesn't matter). |
+| **Scale** | A scale run from a random root, matched in ascending order. |
+| **Mode** | A modal scale run from a random root, matched in ascending order. |
+| **Progression** | A chord-degree progression (e.g. I–IV–V) in a random key, matched in order. |
+| **Lick** | A short pre-written phrase from the content library, matched in order. |
+| **Piece** | An excerpt from a longer piece in the content library, matched in order. |
+
+By default the enabled categories cycle in the order above; **Random
+mode** instead draws both the category *and* the per-prompt time window
+uniformly at random on every prompt. Every target note in every mode is a
+real, fretted pitch on the active tuning (built-in or custom) — chords are
+voiced string-by-string, scales/modes/progressions/licks/pieces are
+re-voiced degree-by-degree so nothing lands outside the fretboard's
+playable range. Custom-content Licks/Pieces can be extended via **Custom
+content path** in Settings, pointing at your own TOML library merged
+alongside the built-ins by name.
+
+## Fretboard visualizer
+
+On a wide terminal (`≥140` columns), the Practice screen's right-hand
+panel renders a full interactive fretboard for the active tuning: a
+column per string (labelled with its open note), a row per fret from open
+(`0`) through fret 22, with the traditional single/double position-marker
+dots (frets 3/5/7/9/15/17/19/21 and the double-dot 12th) for a real-neck
+feel. It re-renders instantly whenever the tuning changes — built-in or
+custom.
+
+Turning on **Fretboard highlight** in Settings switches it from a static
+reference into a live prompt aid: every still-needed target note in the
+current prompt is picked out in the accent color across every string/fret
+it can be played on, and a legend below the board explains the fret-marker
+dot vs. the highlight color.
+
 ## Repository layout
 
 ```
@@ -104,12 +145,6 @@ typed input and commit on `Enter`.
 - **Add custom tuning** — shows the TOML schema and rules, then lets you set
   (and immediately load) the path to your tunings file; the status line
   reports how many tunings loaded or why loading failed.
-
-Random mode draws category *and* duration uniformly at random each prompt
-instead of cycling the enabled categories in a fixed order. Fretboard
-highlight (Practice screen only, wide terminal) marks the current prompt's
-still-needed target note(s) on the live board instead of showing a static
-reference.
 
 ## Android
 
