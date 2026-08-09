@@ -686,35 +686,37 @@ fn is_short(area: Rect) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Hero panel content budget — shared between `draw_practice` (which sizes
-// the panel's outer `Rect` to fit exactly this much, so leftover screen
-// height becomes an ordinary spacer between cards instead of dead space
-// trapped inside the border) and `render_hero_prompt` (which lays out its
-// rows to this same budget). Keeping one source of truth means the two
-// can never drift apart.
+// Hero panel subsection sizing — shared between `draw_practice` (which now
+// sizes the panel's outer `Rect` to fill the available column, via
+// `Constraint::Fill`) and `render_hero_prompt` (which splits that height
+// into three equal subsections — Heading, Notes, Detected — with
+// `HERO_SECTION_GAP` between each. Heading and Notes cap their inner
+// content (`HERO_HEADING_CONTENT_H`, `HERO_CHIP_H`) and center it inside
+// their box so it stays a fixed, comfortable size even as the section
+// around it grows on a taller terminal; Detected's box has no cap — it
+// fills its whole section directly, same as Heading's border does.
 // ---------------------------------------------------------------------------
 const HERO_TOP_MARGIN: u16 = 1;
 /// Always reserved, whether the prompt name renders as big glyphs or
-/// compact text — keeps the panel's height (and every row below it)
-/// stable across prompts instead of jumping with name length.
+/// compact text — keeps the heading box's content height stable across
+/// prompts instead of jumping with name length.
 const HERO_NAME_H: u16 = 4;
 const HERO_GAP1: u16 = 1;
 const HERO_CAPTION_H: u16 = 1;
-const HERO_GAP2: u16 = 2;
+/// Fixed content height of the heading+subheading group (name + internal
+/// gap + caption), centered inside its own bordered box — see
+/// `render_heading_box`.
+const HERO_HEADING_CONTENT_H: u16 = HERO_NAME_H + HERO_GAP1 + HERO_CAPTION_H;
+/// Cap on the target-chip row's height, centered inside the Notes section
+/// instead of stretched — keeps individual note chips a comfortable,
+/// unchanged size even though the section around them grows on a tall
+/// terminal.
 const HERO_CHIP_H: u16 = 9;
-const HERO_GAP3: u16 = 1;
-const HERO_DETECTED_H: u16 = 7;
 const HERO_BOTTOM_MARGIN: u16 = 1;
-const HERO_CONTENT_H: u16 = 2 // borders
-    + HERO_TOP_MARGIN
-    + HERO_NAME_H
-    + HERO_GAP1
-    + HERO_CAPTION_H
-    + HERO_GAP2
-    + HERO_CHIP_H
-    + HERO_GAP3
-    + HERO_DETECTED_H
-    + HERO_BOTTOM_MARGIN;
+/// Gap between the three subsections (Heading, Notes, Detected) — one
+/// constant so every gap between rows is identical ("even padding and
+/// margins" between the three, per the one-column/3-row layout request).
+const HERO_SECTION_GAP: u16 = 2;
 
 /// Dot-separated list of the currently enabled challenge categories, e.g.
 /// "Note · Chord · Scale". Shown on the Menu and Practice session panels so
@@ -922,8 +924,9 @@ fn draw_menu(
 }
 
 /// Vertically centers a `content_h`-row block within `rect`, leaving any
-/// leftover space split evenly above and below. Used to keep the target
-/// chips comfortably framed instead of stretching to fill a tall panel.
+/// leftover space split evenly above and below. Used to keep each hero
+/// subsection's actual content (heading text, target chips, Detected box)
+/// comfortably framed instead of stretching to fill its larger section.
 fn center_v(rect: Rect, content_h: u16) -> Rect {
     if rect.height <= content_h {
         return rect;
@@ -1126,33 +1129,28 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
     }
 }
 
-/// Renders the current-prompt hero panel: kind title (small, in the
-/// border), then the prompt name, match caption, target-note chips, and
-/// the Detected indicator, in that top-to-bottom reading order with a
-/// small fixed margin under the border. Previously this content was
-/// vertically *centered* as one block, which on a tall full-screen
-/// terminal left a large dead gap above the heading — the most-reported
-/// issue. Any true leftover height now trails below the group as ordinary
-/// bottom padding instead of floating the heading mid-panel. The prompt
-/// name renders as block-glyph big text when the panel has enough width
-/// and height to hold it without wrapping or clipping (a long Lick/Piece
-/// name degrades to compact letter-spaced text instead of overflowing);
-/// the match caption is always compact text — rendering it as big text
-/// only when the string was short enough previously made near-identical
-/// captions look different at every target count (a 1-target Note prompt
-/// vs. a 7-target Mode prompt's longer "— IN ORDER" string), which is a
+/// The prompt name + match-count caption, boxed as its own bordered
+/// subsection — the sibling of the Notes chips and the Detected box, all
+/// three now spread evenly inside the hero panel (see `render_hero_prompt`).
+/// The prompt name renders as block-glyph big text when its row has the
+/// full 4 rows the glyph needs and the panel is wide enough to hold it
+/// without wrapping or clipping (a long Lick/Piece name degrades to
+/// compact letter-spaced text instead of overflowing); the match caption
+/// is always compact text — rendering it as big text only when the string
+/// was short enough previously made near-identical captions look
+/// different at every target count (a 1-target Note prompt vs. a
+/// 7-target Mode prompt's longer "— IN ORDER" string), which is a
 /// consistency bug, not a size choice.
-fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
-        .title(Span::styled(
-            format!(" {} ", ui.prompt_kind),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
 
     let name = ui.prompt_display.trim();
     let caption = if ui.ordered {
@@ -1169,42 +1167,24 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
     };
 
+    // Reserve the fixed name+gap+caption budget, centered within whatever
+    // height this box actually has — equal to the Notes/Detected boxes on
+    // a normal terminal, shrinking gracefully on a very short one.
+    let content = center_v(inner, HERO_HEADING_CONTENT_H.min(inner.height));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(HERO_NAME_H), Constraint::Length(HERO_GAP1), Constraint::Length(HERO_CAPTION_H)])
+        .split(content);
+
     // Big-text glyphs are 4 terminal columns wide per source character —
     // see `render_targets_row`/`render_detected_indicator` for the same
     // measurement (PixelSize::Quadrant, U+2580-range Block Elements, safe
-    // on every monospace terminal font).
+    // on every monospace terminal font). Only worth it when the reserved
+    // name row actually kept its full 4-row height (i.e. wasn't clamped
+    // down by a cramped box) and the glyph fits the width.
     const BIG_COLS_NAME: u16 = 4;
-    const MIN_BIG_TEXT_INNER_H: u16 = 20;
-    let allow_big = inner.height >= MIN_BIG_TEXT_INNER_H;
-    let name_big = allow_big && !name.is_empty() && (name.chars().count() as u16) * BIG_COLS_NAME <= inner.width;
-
-    // Sized to the shared `HERO_*` budget (see its definition) rather than
-    // stretched to whatever's left — `draw_practice` now sizes this panel's
-    // outer `Rect` to that same budget, so `inner.height` is normally an
-    // exact fit; the clamps below only kick in as a graceful shrink on a
-    // genuinely cramped terminal. The name row is always reserved at its
-    // full height (whether big-glyph or compact text renders inside it) so
-    // the panel's height never jumps between a short and a long prompt name.
-    let fixed_h =
-        HERO_TOP_MARGIN + HERO_NAME_H + HERO_GAP1 + HERO_CAPTION_H + HERO_GAP2;
-    let remaining = inner.height.saturating_sub(fixed_h + HERO_GAP3);
-    let chip_h = remaining.saturating_sub(HERO_DETECTED_H).clamp(5, HERO_CHIP_H);
-    let detected_h = remaining.saturating_sub(chip_h).clamp(5, HERO_DETECTED_H);
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(HERO_TOP_MARGIN),
-            Constraint::Length(HERO_NAME_H),
-            Constraint::Length(HERO_GAP1),
-            Constraint::Length(HERO_CAPTION_H),
-            Constraint::Length(HERO_GAP2),
-            Constraint::Length(chip_h),
-            Constraint::Length(HERO_GAP3),
-            Constraint::Length(detected_h),
-            Constraint::Fill(1),
-        ])
-        .split(inner);
+    let name_big =
+        rows[0].height >= 4 && !name.is_empty() && (name.chars().count() as u16) * BIG_COLS_NAME <= content.width;
 
     if name_big {
         let big = BigText::builder()
@@ -1213,23 +1193,82 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
             .centered()
             .lines(vec![Line::from(name.to_string())])
             .build();
-        f.render_widget(big, layout[1]);
+        f.render_widget(big, rows[0]);
     } else {
         let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-        let name_text = if spaced.chars().count() as u16 <= inner.width { spaced } else { name.to_string() };
+        let name_text = if spaced.chars().count() as u16 <= content.width { spaced } else { name.to_string() };
         f.render_widget(
             Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
-            center_v(layout[1], 1),
+            center_v(rows[0], 1),
         );
     }
 
     f.render_widget(
         Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
-        center_v(layout[3], 1),
+        center_v(rows[2], 1),
     );
+}
 
-    render_targets_row(f, layout[5], ui, theme);
-    render_detected_indicator(f, layout[7], ui, theme);
+/// Renders the current-prompt hero panel as three bordered subsections —
+/// Heading/Subheading, Notes, Detected — stacked in one column and spread
+/// evenly across the panel's full height via three equal `Fill(1)` rows
+/// with identical gaps between them (`HERO_SECTION_GAP`). Previously these
+/// three lived at a fixed content height stacked at the panel's top, which
+/// either centered as one block (leaving a large dead gap above the
+/// heading) or top-anchored (stranding a large dead gap below the
+/// Detected box, outside any visible boundary) — both were the
+/// most-reported issue. Now `draw_practice` sizes the panel itself to
+/// fill the available column, so the three subsections — each its own
+/// clearly bounded "card" — always occupy the panel's real height with no
+/// unbounded space left over.
+fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
+        .title(Span::styled(
+            format!(" {} ", ui.prompt_kind),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(HERO_TOP_MARGIN),
+            Constraint::Fill(1),
+            Constraint::Length(HERO_SECTION_GAP),
+            Constraint::Fill(1),
+            Constraint::Length(HERO_SECTION_GAP),
+            Constraint::Fill(1),
+            Constraint::Length(HERO_BOTTOM_MARGIN),
+        ])
+        .split(inner);
+    let heading_section = sections[1];
+    let notes_section = sections[3];
+    let detected_section = sections[5];
+
+    render_heading_box(f, heading_section, ui, theme);
+
+    // Notes and Detected each get their own bordered box spanning the full
+    // section — the same treatment as the Heading box — so all three read
+    // as visually consistent, equally-sized cards. Their actual content
+    // (the target chips, the detected-note text) stays the same fixed,
+    // capped size as before and is centered inside that box; only the
+    // surrounding frame now grows with the section instead of hugging the
+    // content tightly and leaving unbordered dead space around it.
+    let notes_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
+        .title(" Notes ");
+    let notes_inner = notes_block.inner(notes_section);
+    f.render_widget(notes_block, notes_section);
+    let notes_h = HERO_CHIP_H.min(notes_inner.height);
+    render_targets_row(f, center_v(notes_inner, notes_h), ui, theme);
+
+    render_detected_indicator(f, detected_section, ui, theme);
 }
 
 #[cfg(test)]
@@ -1301,28 +1340,20 @@ fn draw_practice(
     let (hero_area, timer_area, action_area, slot) = if wide {
         // Wide: two columns — prompt/timer/actions on the left, a
         // full-height Session panel (score, device, tuning, categories,
-        // recent attempts) on the right. Hero is sized to its actual
-        // content (`HERO_CONTENT_H`, shared with `render_hero_prompt`)
-        // rather than stretched to fill the column — on a tall terminal
-        // that stretch previously either centered the heading in a huge
-        // gap or, after top-anchoring, stranded a large dead zone below
-        // it. Leftover height now becomes an ordinary spacer between the
-        // hero card and the Timer, same as the whitespace between any two
-        // dashboard cards.
+        // recent attempts) on the right. Hero now fills the available
+        // column height (rather than a fixed content budget with a
+        // separate spacer below it) so its three subsections — Heading,
+        // Notes, Detected — can spread evenly across the panel's real
+        // height; see `render_hero_prompt`.
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
             .split(area);
         let left = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(HERO_CONTENT_H),
-                Constraint::Fill(1),
-                Constraint::Length(6),
-                Constraint::Length(3),
-            ])
+            .constraints([Constraint::Fill(1), Constraint::Length(6), Constraint::Length(3)])
             .split(cols[0]);
-        (left[0], left[2], left[3], SessionSlot::Panel(cols[1]))
+        (left[0], left[1], left[2], SessionSlot::Panel(cols[1]))
     } else if is_short(area) {
         // Narrow AND short: no room for a panel — collapse to the single
         // score/device line the screen has always shown here. Terminal is
@@ -1341,13 +1372,15 @@ fn draw_practice(
     } else {
         // Narrow but tall enough: single column, with the Session panel
         // (compact — no categories line) dropped beneath the action bar.
-        // Leftover height flows into the Session panel (more room for its
-        // recent-attempts list) instead of sitting idle inside the hero
-        // panel.
+        // Hero and the Session panel now split remaining height evenly
+        // (both `Fill(1)`) instead of hero taking a fixed budget and the
+        // panel absorbing 100% of what's left — same reasoning as the
+        // wide branch: hero's three subsections spread across its real
+        // height rather than a fixed content box.
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(HERO_CONTENT_H),
+                Constraint::Fill(1),
                 Constraint::Length(1),
                 Constraint::Length(6),
                 Constraint::Length(3),
