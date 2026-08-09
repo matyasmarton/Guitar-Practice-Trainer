@@ -1009,8 +1009,15 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
 /// grouped into one tightly-spaced block and centered together in the
 /// panel — keeping the name and the notes to play visually adjacent
 /// instead of pinning the name near the top with the chips centered far
-/// below it. The target notes remain the panel's largest, boldest
-/// element: this is what needs to read clearly from playing distance.
+/// below it. The prompt name and match caption render as block-glyph big
+/// text (the same font the target chips use) whenever the panel has
+/// enough width and height to hold them without wrapping or clipping;
+/// otherwise each falls back independently to compact single-row text —
+/// a long Lick/Piece name (which can run 30+ characters with a note list
+/// in parentheses) degrades gracefully instead of overflowing. The
+/// target notes stay the panel's most heavily framed element (bordered,
+/// checkmarked chip boxes) even when the heading reaches the same glyph
+/// height, since those are what the player has to act on.
 fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1023,16 +1030,50 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Size the chip row first so the name + caption + chips group can be
+    let name = ui.prompt_display.trim();
+    let caption = if ui.ordered {
+        format!("{} OF {} MATCHED — IN ORDER", ui.matched, ui.targets.len())
+    } else {
+        format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
+    };
+    // Heading: accent yellow — the first colored thing the eye lands on.
+    let name_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
+    // Subheading: cyan by default, switching to green once progress starts
+    // — never a flat white line.
+    let caption_style = if ui.matched > 0 {
+        Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
+    };
+
+    // Big-text glyphs are 4 terminal columns wide per source character no
+    // matter the row height (Quadrant and Sextant both halve the 8-col
+    // font horizontally) — only the row count differs. Each string is
+    // measured independently against the panel width, so e.g. a short
+    // chord name renders big while a long Lick name with a note list
+    // falls back to plain text on its own, never wrapping or clipping.
+    const BIG_COLS: u16 = 4;
+    const NAME_BIG_ROWS: u16 = 4; // PixelSize::Quadrant — matches the chip glyphs' height.
+    const CAPTION_BIG_ROWS: u16 = 3; // PixelSize::Sextant — one tier below the heading.
+    // Below this inner height there isn't reliably room for a 4-row
+    // heading plus a 3-row subheading above the chip row's 5-row floor
+    // and its own gaps; fall back to compact text rather than risk the
+    // group overflowing the panel on a short terminal.
+    const MIN_BIG_TEXT_INNER_H: u16 = 24;
+    let fits_big = |s: &str| -> bool { !s.is_empty() && (s.chars().count() as u16) * BIG_COLS <= inner.width };
+    let allow_big = inner.height >= MIN_BIG_TEXT_INNER_H;
+    let name_big = allow_big && fits_big(name);
+    let caption_big = allow_big && fits_big(&caption);
+
+    // Size the chip row last so the name + caption + chips group can be
     // measured as a single block and centered together, rather than
     // pinning the name to the top and centering the chips separately in
-    // whatever space is left over. The name and caption each take 2 rows
-    // (up from 1) and the gap above the chips grows 2→4 rows, so the
-    // heading cluster reads clearly above the notes — which keep their
-    // previous 9-row cap.
-    let name_h: u16 = 2;
+    // whatever space is left over. Gap above the chips is wider than the
+    // gap between name and caption, so the heading cluster reads clearly
+    // above the notes without crowding them.
+    let name_h: u16 = if name_big { NAME_BIG_ROWS } else { 1 };
     let gap_above_caption: u16 = 1;
-    let caption_h: u16 = 2;
+    let caption_h: u16 = if caption_big { CAPTION_BIG_ROWS } else { 1 };
     let gap_above_chips: u16 = 4;
     let fixed_h = name_h + gap_above_caption + caption_h + gap_above_chips;
     let box_h = inner.height.saturating_sub(fixed_h).clamp(5, 9);
@@ -1050,42 +1091,39 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         ])
         .split(group);
 
-    // Prompt name: the heading. Accent yellow — the first colored thing the
-    // eye lands on — bold, letter-spaced, vertically centered in its 2-row
-    // band so it reads as a distinct title above the notes. Falls back to
-    // unspaced text rather than clip if the spacing wouldn't fit the panel.
-    let name = ui.prompt_display.trim();
-    let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-    let name_text = if spaced.chars().count() as u16 <= inner.width {
-        spaced
+    if name_big {
+        let big = BigText::builder()
+            .pixel_size(PixelSize::Quadrant)
+            .style(name_style)
+            .centered()
+            .lines(vec![Line::from(name.to_string())])
+            .build();
+        f.render_widget(big, layout[0]);
     } else {
-        name.to_string()
-    };
-    f.render_widget(
-        Paragraph::new(name_text).alignment(Alignment::Center).style(
-            Style::default()
-                .fg(theme_color(&theme.accent, Color::Yellow))
-                .add_modifier(Modifier::BOLD),
-        ),
-        center_v(layout[0], 1),
-    );
+        // Falls back to unspaced text rather than clip if the letter-spaced
+        // version wouldn't fit the panel.
+        let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+        let name_text = if spaced.chars().count() as u16 <= inner.width { spaced } else { name.to_string() };
+        f.render_widget(
+            Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
+            center_v(layout[0], 1),
+        );
+    }
 
-    let caption = if ui.ordered {
-        format!("{} OF {} MATCHED — IN ORDER", ui.matched, ui.targets.len())
+    if caption_big {
+        let big = BigText::builder()
+            .pixel_size(PixelSize::Sextant)
+            .style(caption_style)
+            .centered()
+            .lines(vec![Line::from(caption.clone())])
+            .build();
+        f.render_widget(big, layout[2]);
     } else {
-        format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
-    };
-    // The subheading: cyan by default, switching to green once progress
-    // starts — never a flat white line.
-    let caption_style = if ui.matched > 0 {
-        Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
-    };
-    f.render_widget(
-        Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
-        center_v(layout[2], 1),
-    );
+        f.render_widget(
+            Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
+            center_v(layout[2], 1),
+        );
+    }
 
     render_targets_row(f, layout[4], ui, theme);
 }
