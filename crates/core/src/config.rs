@@ -62,6 +62,11 @@ pub struct Config {
     pub tuning: crate::tuning::TuningId,
     /// Random mode: randomize the time window *and* content per prompt.
     pub random_mode: bool,
+    /// If true, the Practice screen's Fretboard panel highlights the
+    /// current prompt's still-needed target note(s) instead of showing a
+    /// static reference of every note. Defaults to off (static reference).
+    #[serde(default)]
+    pub fretboard_highlight: bool,
     /// Optional path to a custom-content TOML file.
     #[serde(default)]
     pub custom_content_path: Option<PathBuf>,
@@ -86,6 +91,7 @@ impl Default for Config {
             enabled: EnumSet::all(),
             tuning: crate::tuning::TuningId::default(),
             random_mode: false,
+            fretboard_highlight: false,
             custom_content_path: None,
             audio_device_name: None,
             match_pause_ms: default_match_pause_ms(),
@@ -225,11 +231,21 @@ mod tests {
     }
 
     #[test]
+    fn fretboard_highlight_round_trip_toml() {
+        let mut c = Config::default();
+        c.fretboard_highlight = true;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(back.fretboard_highlight);
+    }
+
+    #[test]
     fn config_without_new_fields_parses_with_defaults() {
         // Simulates an already-deployed config.toml predating `tuning`/`match_pause_ms`.
         let text = "default_duration_sec = 30\nenabled = []\nrandom_mode = false\n";
         let c: Config = toml::from_str(text).unwrap();
         assert_eq!(c.tuning, crate::tuning::TuningId::AllFourths);
         assert_eq!(c.match_pause_ms, 3000);
+        assert!(!c.fretboard_highlight);
     }
 }
