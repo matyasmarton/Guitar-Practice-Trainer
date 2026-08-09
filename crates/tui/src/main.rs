@@ -8,6 +8,7 @@
 //! The only exception is typing the timer seconds or a custom content path,
 //! which unavoidably need the keyboard — everything else is pure navigation.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -22,16 +23,37 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
+use tui_big_text::{BigText, PixelSize};
 use scopeguard::defer;
 
 use guitar_trainer_core::audio;
 use guitar_trainer_core::challenges::ChallengeType;
 use guitar_trainer_core::config::{Config, EnabledCategory};
 use guitar_trainer_core::engine::{Engine, EngineEvent, EngineListener};
+use guitar_trainer_core::note::Note;
 use guitar_trainer_core::theme::Theme;
 use guitar_trainer_core::tuning::TuningId;
+
+/// One completed prompt, kept for the Practice screen's "recent attempts"
+/// list (see `UiState::history`). Built purely from events the engine
+/// already streams — no `crates/core` changes.
+#[derive(Clone)]
+enum AttemptResult {
+    Passed,
+    TimedOut,
+}
+
+#[derive(Clone)]
+struct Attempt {
+    kind: String,
+    display: String,
+    result: AttemptResult,
+}
+
+/// Bound on `UiState::history` — "last ~8 prompts" per the redesign plan.
+const HISTORY_CAP: usize = 8;
 
 /// UI-facing snapshot derived from engine events + `engine.progress()`.
 #[derive(Default, Clone)]
@@ -58,6 +80,10 @@ struct UiState {
     cooldown_started: Option<std::time::Instant>,
     /// Duration of the current/most recent cooldown.
     cooldown_ms: u64,
+    /// Rolling window of recently completed prompts (pass/timeout), most
+    /// recent last. TUI-local bookkeeping for the Practice screen's Session
+    /// panel — capped at `HISTORY_CAP`.
+    history: VecDeque<Attempt>,
 }
 
 /// Channel-backed listener: the render loop drains `rx`.
@@ -149,6 +175,12 @@ fn drain_device_scan(app: &mut App) {
 fn main() -> Result<()> {
     // Terminal setup.
     enable_raw_mode()?;
+    // This app is a full-screen TUI whose color carries semantics (yellow
+    // selection, green matches, red warnings); it is not a plain stdout
+    // program, so it opts out of the NO_COLOR convention that crossterm
+    // honors by default. Without this, a NO_COLOR env var (even one set by
+    // a shell wrapper) silently strips every color from the whole UI.
+    crossterm::style::Colored::set_ansi_color_disabled(false);
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     defer! {
@@ -224,6 +256,21 @@ fn drain_events(rx: &Receiver<EngineEvent>, ui: &mut UiState, engine: &Engine) {
     ui.prompt_secs = total;
 }
 
+/// Record a just-finished prompt into the rolling history, capped at
+/// `HISTORY_CAP`. Called from `apply_event` on `Passed`/`Timeout`, using the
+/// prompt kind/display already tracked on `ui` (still the just-completed
+/// prompt's — the next `Prompt` event hasn't landed yet).
+fn push_attempt(ui: &mut UiState, result: AttemptResult) {
+    ui.history.push_back(Attempt {
+        kind: ui.prompt_kind.clone(),
+        display: ui.prompt_display.clone(),
+        result,
+    });
+    while ui.history.len() > HISTORY_CAP {
+        ui.history.pop_front();
+    }
+}
+
 fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
     match ev {
         EngineEvent::Prompt(v) => {
@@ -241,12 +288,13 @@ fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
             }
             ui.matched = ui.matched_indices.iter().filter(|&&m| m).count();
         }
-        EngineEvent::Passed => {}
+        EngineEvent::Passed => push_attempt(ui, AttemptResult::Passed),
         EngineEvent::Cooldown { duration_ms } => {
             ui.cooldown_started = Some(std::time::Instant::now());
             ui.cooldown_ms = *duration_ms;
         }
         EngineEvent::Timeout => {
+            push_attempt(ui, AttemptResult::TimedOut);
             ui.matched = 0;
         }
         EngineEvent::Score { passed, total } => {
@@ -588,11 +636,253 @@ fn parse_color(hex: &str, fallback: Color) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// True if the terminal advertises 24-bit color (`COLORTERM=truecolor` /
+/// `24bit`). macOS Terminal.app and other 256-color terminals omit this;
+/// ratatui 0.28 has no capability probe, so the env check is the standard
+/// heuristic (the one used by crossterm's own `supports_color` era, tmux,
+/// and most CLI tools).
+fn truecolor_terminal() -> bool {
+    std::env::var("COLORTERM")
+        .map(|v| v.contains("truecolor") || v.contains("24bit"))
+        .unwrap_or(false)
+}
+
+/// Theme hex → ratatui `Color`. On truecolor terminals the exact hex value
+/// is used; everywhere else the caller's *named* `fallback` is used instead
+/// — named ANSI colors (Cyan/Yellow/Green/…) render in every terminal,
+/// where raw `38;2` RGB sequences silently fall back to default on
+/// non-truecolor emulators. Without this, a missing `COLORTERM` blanks all
+/// theme color at once.
+fn theme_color(hex: &str, fallback: Color) -> Color {
+    if truecolor_terminal() {
+        parse_color(hex, fallback)
+    } else {
+        fallback
+    }
+}
+
 fn selection_style(theme: &Theme) -> Style {
     Style::default()
-        .fg(parse_color(&theme.selection_fg, Color::Black))
-        .bg(parse_color(&theme.selection_bg, Color::Yellow))
+        .fg(theme_color(&theme.selection_fg, Color::Black))
+        .bg(theme_color(&theme.selection_bg, Color::Yellow))
         .add_modifier(Modifier::BOLD)
+}
+
+// ---------------------------------------------------------------------------
+// Layout thresholds — every screen below chooses a wide (multi-column /
+// panel) or narrow (single-column) layout from these, and never leaves more
+// than the deliberate Fill-spacer remainder unclaimed at any size.
+// ---------------------------------------------------------------------------
+
+const WIDE_COLS: u16 = 140;
+const SHORT_ROWS: u16 = 30;
+
+fn is_wide(area: Rect) -> bool {
+    area.width >= WIDE_COLS
+}
+
+fn is_short(area: Rect) -> bool {
+    area.height < SHORT_ROWS
+}
+
+// ---------------------------------------------------------------------------
+// Hero panel subsection sizing — shared between `draw_practice` (which now
+// sizes the panel's outer `Rect` to fill the available column, via
+// `Constraint::Fill`) and `render_hero_prompt` (which splits that height
+// into three equal subsections — Heading, Notes, Detected — with
+// `HERO_SECTION_GAP` between each. Heading and Notes cap their inner
+// content (`HERO_HEADING_CONTENT_H`, `HERO_CHIP_H`) and center it inside
+// their box so it stays a fixed, comfortable size even as the section
+// around it grows on a taller terminal; Detected's box has no cap — it
+// fills its whole section directly, same as Heading's border does.
+// ---------------------------------------------------------------------------
+const HERO_TOP_MARGIN: u16 = 1;
+/// Reserved for the prompt name regardless of length — sized to the
+/// tallest glyph tier the name can render at (`PixelSize::Full`, 8 rows;
+/// see `HERO_NAME_GLYPH_ROWS`), keeping the heading box's content height
+/// stable across prompts whether or not a given name qualifies for glyph
+/// rendering.
+const HERO_NAME_H: u16 = 8;
+const HERO_GAP1: u16 = 1;
+const HERO_CAPTION_H: u16 = 1;
+/// Fixed content height of the heading+subheading group (name + internal
+/// gap + caption), centered inside its own bordered box — see
+/// `render_heading_box`.
+const HERO_HEADING_CONTENT_H: u16 = HERO_NAME_H + HERO_GAP1 + HERO_CAPTION_H;
+/// Cap on the target-chip row's height, centered inside the Notes section
+/// instead of stretched — keeps individual note chips a comfortable,
+/// unchanged size even though the section around them grows on a tall
+/// terminal.
+const HERO_CHIP_H: u16 = 6;
+const HERO_BOTTOM_MARGIN: u16 = 1;
+/// Gap between the three subsections (Heading, Notes, Detected) — one
+/// constant so every gap between rows is identical ("even padding and
+/// margins" between the three, per the one-column/3-row layout request).
+const HERO_SECTION_GAP: u16 = 2;
+/// Floor on each hero subsection's own height (Heading, Notes, Detected),
+/// used instead of a bare `Constraint::Fill(1)` for the three-way split in
+/// `render_hero_prompt`. Two rows of border plus at least one content row
+/// (3) is the least a chip needs to show its label at all — below that,
+/// `render_thick_rounded_border`/`center_v` collapse to a zero-height
+/// inner rect and the label silently vanishes while the section's own
+/// outer border keeps drawing, which read as a total rendering failure.
+/// Splitting hero's height with three bare `Fill(1)`s (further nested
+/// inside `draw_practice`'s own `Fill(1)` sharing with the Session panel)
+/// meant each subsection's actual height was two layers of floor-division
+/// remainder away from the terminal's row count — non-monotonic, so a
+/// *taller* terminal could land on a *worse* remainder than a shorter one.
+/// `Constraint::Min` still grows a section past this floor when the
+/// terminal has room, but never lets one drop below it while any of that
+/// two-layer remainder math has slack to give.
+const HERO_SECTION_MIN_H: u16 = 5;
+
+/// Terminal rows/columns spanned by one glyph of the note-chip / Detected
+/// value text, rendered via `tui_big_text` at `PixelSize::HalfHeight` (not
+/// `Quadrant`, which was tried here before and rejected as too
+/// chunky/angular: both are 4 rows tall, but `HalfHeight` samples twice
+/// the horizontal detail per character, so diagonal strokes step more
+/// finely and read softer). Built from the same safe Block Elements range
+/// (▀▄█, U+2580-259F) already verified glitch-free in this terminal — see
+/// the Sextant→HalfHeight caption fix.
+const HERO_GLYPH_ROWS: u16 = 4;
+const HERO_GLYPH_COLS_PER_CHAR: u16 = 8;
+/// Narrower fallback tier (`PixelSize::Quadrant`) for content that won't
+/// fit `HERO_GLYPH_COLS_PER_CHAR`'s width at the given terminal size —
+/// half the columns per glyph, same `HERO_GLYPH_ROWS` height. Used so a
+/// wide chord/scale's chip row (many simultaneous targets) still renders
+/// as glyph text at *some* size instead of silently dropping to plain
+/// crisp text while a 1-2 target prompt next to it renders full-size —
+/// that per-prompt size flip was the reported "chip font inconsistent"
+/// bug. Plain text remains the last-resort fallback only for the rare
+/// case that doesn't fit even this tier.
+const HERO_GLYPH_COLS_PER_CHAR_NARROW: u16 = 4;
+/// Row height of the prompt name at `PixelSize::Full` (8 rows — literally
+/// double `HERO_GLYPH_ROWS`, matching the requested ~56pt-heading vs
+/// ~36pt-chip size relationship while keeping the same
+/// `HERO_GLYPH_COLS_PER_CHAR`-wide, softest-available horizontal
+/// resolution). `render_heading_box` only uses it for names that are pure
+/// ASCII: `font8x8::BASIC_FONTS` (the glyph table `tui_big_text` renders
+/// from) has no entry for the en dash `–` used in every Progression name
+/// ("I–IV–V–I in A2"), so glyph mode would silently render those dashes
+/// as blank cells — the same class of bug already hit and fixed for the
+/// idle "—" Detected placeholder. Progression names fall back to the
+/// existing crisp letter-spaced text instead.
+const HERO_NAME_GLYPH_ROWS: u16 = 8;
+
+/// Dot-separated list of the currently enabled challenge categories, e.g.
+/// "Note · Chord · Scale". Shown on the Menu and Practice session panels so
+/// "what's enabled" is visible without opening Settings.
+fn category_chips(settings: &SettingsState) -> String {
+    let on: Vec<&str> = settings
+        .enabled
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(c, _)| c.label())
+        .collect();
+    if on.is_empty() {
+        "(none enabled)".to_string()
+    } else {
+        on.join(" · ")
+    }
+}
+
+/// Score / device / tuning / categories — the read-only session facts shown
+/// on both the Menu's "Last Session" card and the Practice screen's Session
+/// panel, built once so the two can never drift apart.
+fn session_summary_lines(ui: &UiState, settings: &SettingsState, theme: &Theme) -> Vec<Line<'static>> {
+    let device_name = settings
+        .audio_device
+        .clone()
+        .unwrap_or_else(|| "(default mic)".to_string());
+    let label_style = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
+    vec![
+        Line::from(vec![
+            Span::styled("Score      ", label_style),
+            Span::styled(format!("✓ {}/{}", ui.score_passed, ui.score_total), value_style),
+        ]),
+        Line::from(vec![Span::styled("Device     ", label_style), Span::raw(device_name)]),
+        Line::from(vec![
+            Span::styled("Tuning     ", label_style),
+            Span::raw(settings.tuning.label().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Categories ", label_style),
+            Span::raw(category_chips(settings)),
+        ]),
+    ]
+}
+
+/// The Practice screen's session panel: the summary above plus a rolling
+/// "recent attempts" list sourced from `ui.history`. Read-only and
+/// non-focusable — it never participates in `app.practice_idx`.
+/// `show_categories` is dropped in the compact (narrow-terminal) placement
+/// to leave more room for the attempts list.
+fn render_session_panel(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+    show_categories: bool,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
+        .title(" Session ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut summary = session_summary_lines(ui, settings, theme);
+    if !show_categories {
+        summary.pop();
+    }
+    let summary_h = summary.len() as u16;
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(summary_h), Constraint::Length(1), Constraint::Fill(1)])
+        .split(inner);
+
+    f.render_widget(Paragraph::new(summary).wrap(Wrap { trim: true }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Recent",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )),
+        rows[1],
+    );
+
+    let success_style = Style::default().fg(theme_color(&theme.success, Color::Green));
+    let danger_style = Style::default().fg(theme_color(&theme.danger, Color::Red));
+    if ui.history.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "No attempts yet this session.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            rows[2],
+        );
+    } else {
+        let items: Vec<ListItem> = ui
+            .history
+            .iter()
+            .rev()
+            .map(|a| {
+                let (mark, style) = match a.result {
+                    AttemptResult::Passed => ("✓", success_style),
+                    AttemptResult::TimedOut => ("⏱", danger_style),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{mark} "), style),
+                    Span::styled(format!("{:<11}", a.kind), Style::default().fg(Color::DarkGray)),
+                    Span::raw(a.display.clone()),
+                ]))
+            })
+            .collect();
+        f.render_widget(List::new(items), rows[2]);
+    }
 }
 
 fn draw_menu(
@@ -605,42 +895,577 @@ fn draw_menu(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(3)])
+        .constraints([Constraint::Length(3), Constraint::Fill(1), Constraint::Length(3)])
         .split(area);
 
-    let title = Paragraph::new("Guitar Practice Trainer")
-        .alignment(Alignment::Center)
-        .style(Style::default().add_modifier(Modifier::BOLD));
-    f.render_widget(title, chunks[0]);
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Guitar Practice Trainer",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            settings.tuning.label().to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .alignment(Alignment::Center);
+    f.render_widget(header, chunks[0]);
+
+    let list_h = (MENU_ITEMS.len() as u16 + 2).min(chunks[1].height);
+    let wide = is_wide(area);
+
+    let (menu_area, card_area) = if wide {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Fill(1)])
+            .split(chunks[1]);
+        let menu_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Length(list_h), Constraint::Fill(1)])
+            .split(cols[0]);
+        (menu_rows[1], cols[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_h), Constraint::Fill(1)])
+            .split(chunks[1]);
+        (rows[0], rows[1])
+    };
 
     let items: Vec<ListItem> = MENU_ITEMS.iter().map(|s| ListItem::new(*s)).collect();
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Menu — ↑↓ select, Enter to activate "),
         )
         .highlight_style(selection_style(theme))
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.menu_idx));
-    f.render_stateful_widget(list, chunks[1], &mut state);
+    f.render_stateful_widget(list, menu_area, &mut state);
+
+    let card_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Last Session ");
+    let card_inner = card_block.inner(card_area);
+    f.render_widget(card_block, card_area);
+    f.render_widget(
+        Paragraph::new(session_summary_lines(ui, settings, theme)).wrap(Wrap { trim: true }),
+        card_inner,
+    );
 
     let device_name = settings
         .audio_device
         .clone()
         .unwrap_or_else(|| "(default mic)".to_string());
     let (footer_text, footer_style) = match &ui.status {
-        Some(msg) => (msg.clone(), Style::default().fg(parse_color(&theme.danger, Color::Red))),
+        Some(msg) => (msg.clone(), Style::default().fg(theme_color(&theme.danger, Color::Red))),
         None => (
             format!("mic: {device_name}   ✓{}/{}", ui.score_passed, ui.score_total),
-            Style::default().fg(parse_color(&theme.secondary, Color::Cyan)),
+            Style::default().fg(theme_color(&theme.secondary, Color::Cyan)),
         ),
     };
     let footer = Paragraph::new(footer_text)
         .alignment(Alignment::Center)
         .style(footer_style);
     f.render_widget(footer, chunks[2]);
+}
+
+/// Vertically centers a `content_h`-row block within `rect`, leaving any
+/// leftover space split evenly above and below. Used to keep each hero
+/// subsection's actual content (heading text, target chips, Detected box)
+/// comfortably framed instead of stretching to fill its larger section.
+fn center_v(rect: Rect, content_h: u16) -> Rect {
+    if rect.height <= content_h {
+        return rect;
+    }
+    let pad = (rect.height - content_h) / 2;
+    Rect { x: rect.x, y: rect.y + pad, width: rect.width, height: content_h }
+}
+
+/// Hand-drawn rounded border with heavier top/bottom/side rules than
+/// `BorderType::Rounded` — ratatui's box-drawing set has no glyph that is
+/// both heavy-weight *and* rounded at the corners, so this pairs the
+/// existing light rounded corners (╭╮╰╯, kept because the chips were
+/// explicitly approved for their rounded look) with heavy straight lines
+/// (━ ┃, the same Box Drawing block already used for the light rules
+/// elsewhere in this file — no new/unverified Unicode range). Returns the
+/// inner `Rect`, matching `Block::inner`.
+fn render_thick_rounded_border(f: &mut ratatui::Frame<'_>, area: Rect, style: Style) -> Rect {
+    if area.width < 2 || area.height < 2 {
+        return area;
+    }
+    let buf = f.buffer_mut();
+    let (x0, y0) = (area.x, area.y);
+    let (x1, y1) = (area.x + area.width - 1, area.y + area.height - 1);
+    buf.set_string(x0, y0, "╭", style);
+    buf.set_string(x1, y0, "╮", style);
+    buf.set_string(x0, y1, "╰", style);
+    buf.set_string(x1, y1, "╯", style);
+    if x1 > x0 + 1 {
+        let h = "━".repeat((x1 - x0 - 1) as usize);
+        buf.set_string(x0 + 1, y0, &h, style);
+        buf.set_string(x0 + 1, y1, &h, style);
+    }
+    for y in (y0 + 1)..y1 {
+        buf.set_string(x0, y, "┃", style);
+        buf.set_string(x1, y, "┃", style);
+    }
+    Rect::new(x0 + 1, y0 + 1, area.width.saturating_sub(2), area.height.saturating_sub(2))
+}
+
+/// The notes to actually play — the single most important piece of
+/// information during practice, and the hero panel's largest, boldest
+/// element. Each target is its own hand-drawn chip: a heavier-weight
+/// rounded border (`render_thick_rounded_border`, per the "thicker chip
+/// border" request) framing the note value. Tries four tiers in order —
+/// `PixelSize::HalfHeight` glyph (the approved "36pt" size), narrower
+/// `PixelSize::Quadrant` glyph, letter-spaced crisp text, then unspaced
+/// compact crisp text — and, critically, fit-checks *every* tier against
+/// the actual available width before committing to it. The previous
+/// version picked crisp text unconditionally as a last resort with no
+/// fit check at all: an 11-target Lick (e.g. "Major pentatonic run")
+/// needed ~171 columns but the panel only has ~155-161, so ratatui's
+/// constraint solver silently compressed some `Constraint::Length` chip
+/// cells more than others — chips in the *same row* rendered at visibly
+/// different widths, clipping labels like "F#2" down to "F #". That was
+/// the actual "font inconsistent between modes" bug: Note/Chord (few
+/// targets) always fit the glyph tiers and looked fine, while Lick/Piece
+/// (many targets) silently hit this unfit crisp tier and looked broken.
+/// Every tier below is now fit-checked before use, and if truly nothing
+/// fits, the last resort uniformly shrinks every chip to the same width
+/// instead of letting the layout engine compress cells unevenly — chip
+/// size within a row is always uniform, and the tier ladder itself is
+/// identical across every challenge mode from Note to Piece. A checkmark
+/// glyph isn't in the underlying 8x8 font, so the two glyph tiers carry
+/// match state via color alone (border + text turn green), the same
+/// convention already used by `render_detected_indicator`; the two crisp
+/// tiers keep a leading checkmark. Ordered prompts chain the chips with
+/// an arrow so the required sequence reads left to right; unordered
+/// prompts space them evenly.
+fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
+    let idle_border = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
+    let idle_text = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
+
+    let gap_w: u16 = if ui.ordered { 5 } else { 3 };
+    let n = ui.targets.len() as u16;
+
+    let spaced = |t: &str| -> String { t.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
+    let crisp_labels = |space: bool| -> Vec<String> {
+        ui.targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
+                let body = if space { spaced(t) } else { t.clone() };
+                if matched { format!("\u{2713} {body}") } else { body }
+            })
+            .collect()
+    };
+    // Glyph cells already have their own built-in per-character padding
+    // (the 8x8 font's own spacing), so — unlike the crisp tiers, which
+    // need manual letter-spacing to avoid reading cramped — glyph labels
+    // skip it: keeps chips narrower, so more simultaneous targets qualify
+    // for glyph rendering instead of falling back.
+    let glyph_labels: Vec<String> = ui.targets.iter().map(|t| t.clone()).collect();
+    let spaced_labels = crisp_labels(true);
+    let compact_labels = crisp_labels(false);
+
+    let max_chars = |labels: &[String]| labels.iter().map(|l| l.chars().count() as u16).max().unwrap_or(1);
+    let fits = |box_w: u16| box_w.saturating_mul(n) + gap_w.saturating_mul(n.saturating_sub(1)) <= area.width;
+    let fits_height = area.height >= HERO_GLYPH_ROWS + 2;
+
+    let glyph_chars = max_chars(&glyph_labels);
+    let full_box_w = glyph_chars * HERO_GLYPH_COLS_PER_CHAR + 6;
+    let narrow_box_w = glyph_chars * HERO_GLYPH_COLS_PER_CHAR_NARROW + 6;
+    let spaced_box_w = max_chars(&spaced_labels) + 6;
+    let compact_box_w = max_chars(&compact_labels) + 6;
+
+    let (box_w, glyph_pixel_size, labels): (u16, Option<PixelSize>, &Vec<String>) =
+        if fits_height && fits(full_box_w) {
+            (full_box_w, Some(PixelSize::HalfHeight), &glyph_labels)
+        } else if fits_height && fits(narrow_box_w) {
+            (narrow_box_w, Some(PixelSize::Quadrant), &glyph_labels)
+        } else if fits(spaced_box_w) {
+            (spaced_box_w, None, &spaced_labels)
+        } else if fits(compact_box_w) {
+            (compact_box_w, None, &compact_labels)
+        } else {
+            // Nothing fits at its natural width (extreme case: very
+            // narrow terminal with many long labels). Shrink every chip
+            // to the same uniform width the area can actually provide,
+            // rather than handing the layout engine oversized `Length`
+            // constraints it can only satisfy by compressing some cells
+            // more than others — that silent compression was the root
+            // cause of the reported bug.
+            let avail = area.width.saturating_sub(gap_w.saturating_mul(n.saturating_sub(1)));
+            ((avail / n.max(1)).max(1), None, &compact_labels)
+        };
+    let content_w = box_w * n + gap_w * n.saturating_sub(1);
+
+    let outer = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Length(content_w), Constraint::Fill(1)])
+        .split(area);
+
+    let mut cell_constraints = Vec::with_capacity(ui.targets.len() * 2);
+    for i in 0..ui.targets.len() {
+        if i > 0 {
+            cell_constraints.push(Constraint::Length(gap_w));
+        }
+        cell_constraints.push(Constraint::Length(box_w));
+    }
+    let cells = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(cell_constraints)
+        .split(outer[1]);
+
+    let mut ci = 0usize;
+    for i in 0..ui.targets.len() {
+        if i > 0 {
+            if ui.ordered {
+                f.render_widget(
+                    Paragraph::new("→").alignment(Alignment::Center).style(idle_border),
+                    center_v(cells[ci], 1),
+                );
+            }
+            ci += 1;
+        }
+        let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
+        let rect = cells[ci];
+        ci += 1;
+        let (border_style, text_style) = if matched { (success, success) } else { (idle_border, idle_text) };
+        let inner = render_thick_rounded_border(f, rect, border_style);
+        if let Some(pixel_size) = glyph_pixel_size {
+            let glyph = BigText::builder()
+                .pixel_size(pixel_size)
+                .style(text_style)
+                .alignment(Alignment::Center)
+                .lines(vec![Line::from(labels[i].clone())])
+                .build();
+            f.render_widget(glyph, center_v(inner, HERO_GLYPH_ROWS.min(inner.height)));
+        } else {
+            f.render_widget(
+                Paragraph::new(labels[i].clone()).alignment(Alignment::Center).style(text_style),
+                center_v(inner, 1),
+            );
+        }
+    }
+}
+
+/// True if the currently detected note is one of the prompt's still-needed
+/// targets — `None` when nothing is detected right now. For ordered
+/// prompts only the *next* required target counts (matching
+/// `crates/core::engine::required_target_midi`'s rule); for unordered
+/// prompts any remaining target counts. This is a TUI-local comparison
+/// over note *names* — `EngineEvent::DetectedNote` and
+/// `ChallengeView::targets` both come from the same `Note::name()`
+/// formatter in `crates/core`, so string equality is exact and no core
+/// change is needed.
+fn detected_correctness(ui: &UiState) -> Option<bool> {
+    let note = ui.detected_note.as_deref()?;
+    if ui.ordered {
+        let next = ui.matched_indices.iter().position(|m| !m)?;
+        Some(ui.targets.get(next).map(String::as_str) == Some(note))
+    } else {
+        Some(ui.targets.iter().enumerate().any(|(i, t)| {
+            !ui.matched_indices.get(i).copied().unwrap_or(false) && t == note
+        }))
+    }
+}
+
+/// What the mic currently hears — placed directly beneath the target-note
+/// chips (inside the hero panel), colored by correctness: green once the
+/// sounded note is one of the still-needed targets, red when a note is
+/// heard but it isn't one of them, neutral while nothing is detected.
+/// During the post-match cooldown it keeps the existing blink cue
+/// (already-confirmed success) instead of the correctness color. An
+/// actual note renders at the same enlarged `PixelSize::HalfHeight` glyph
+/// size as the note chips (see `render_targets_row`) so the readout
+/// matches their weight; the idle "—" placeholder falls back to plain
+/// text — an em dash has no glyph in the underlying 8x8 font and would
+/// render blank.
+fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
+    let danger = Style::default().fg(theme_color(&theme.danger, Color::Red)).add_modifier(Modifier::BOLD);
+    let neutral = Style::default().add_modifier(Modifier::BOLD);
+    let idle_border = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
+
+    let cooldown_active = ui
+        .cooldown_started
+        .map(|t| t.elapsed() < Duration::from_millis(ui.cooldown_ms))
+        .unwrap_or(false);
+    let (text_style, border_style) = if cooldown_active {
+        let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200) % 2 == 0;
+        let s = if blink_on { success.add_modifier(Modifier::REVERSED) } else { success };
+        (s, success)
+    } else {
+        match detected_correctness(ui) {
+            Some(true) => (success, success),
+            Some(false) => (danger, danger),
+            None => (neutral, idle_border),
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(" Detected ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    match ui.detected_note.as_deref() {
+        Some(note) => {
+            let glyph_w = note.chars().count() as u16 * HERO_GLYPH_COLS_PER_CHAR;
+            if glyph_w <= inner.width && inner.height >= HERO_GLYPH_ROWS {
+                let glyph = BigText::builder()
+                    .pixel_size(PixelSize::HalfHeight)
+                    .style(text_style)
+                    .alignment(Alignment::Center)
+                    .lines(vec![Line::from(note.to_string())])
+                    .build();
+                f.render_widget(glyph, center_v(inner, HERO_GLYPH_ROWS));
+            } else {
+                let spaced: String = note.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+                f.render_widget(
+                    Paragraph::new(spaced).alignment(Alignment::Center).style(text_style),
+                    center_v(inner, 1),
+                );
+            }
+        }
+        None => {
+            f.render_widget(
+                Paragraph::new("—").alignment(Alignment::Center).style(text_style),
+                center_v(inner, 1),
+            );
+        }
+    }
+}
+
+/// The prompt name + match-count caption, boxed as its own bordered
+/// subsection — the sibling of the Notes chips and the Detected box, all
+/// three now spread evenly inside the hero panel (see `render_hero_prompt`).
+/// The name renders as glyph text one size class above the note chips
+/// (`PixelSize::Full`, 8 rows, falling back to `Quadrant`, 4 rows, if the
+/// name is too wide — the same two-tier system `render_targets_row` uses),
+/// so heading and chip weight read as one consistent, deliberately-scaled
+/// family instead of one being glyph text and the other plain. Names
+/// containing non-ASCII characters — every Progression display contains
+/// the en dash `–` ("I–IV–V–I in A2"), which has no glyph in the
+/// `font8x8::BASIC_FONTS` table `tui_big_text` renders from — skip glyph
+/// mode entirely and keep the existing crisp letter-spaced text, since
+/// glyph mode would silently render those dashes as blank cells. The
+/// caption stays crisp, single-row text at all times: it's a short
+/// fixed-format status line ("N OF M MATCHED"), not the prompt's headline.
+fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let name = ui.prompt_display.trim();
+    let caption = if ui.ordered {
+        format!("{} OF {} MATCHED — IN ORDER", ui.matched, ui.targets.len())
+    } else {
+        format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
+    };
+    // Heading: accent yellow — the first colored thing the eye lands on.
+    let name_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
+    // Subheading: cyan by default, switching to green once progress starts.
+    let caption_style = if ui.matched > 0 {
+        Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
+    };
+
+    // Reserve the fixed name+gap+caption budget, centered within whatever
+    // height this box actually has — equal to the Notes/Detected boxes on
+    // a normal terminal, shrinking gracefully on a very short one.
+    let content = center_v(inner, HERO_HEADING_CONTENT_H.min(inner.height));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(HERO_NAME_H), Constraint::Length(HERO_GAP1), Constraint::Length(HERO_CAPTION_H)])
+        .split(content);
+
+    // Glyph labels skip manual letter-spacing (the 8x8 font already has
+    // its own per-character padding), same reasoning as the chip labels —
+    // keeps more names qualifying for the bigger tier instead of falling
+    // back.
+    let ascii_name = !name.is_empty() && name.chars().all(|c| c.is_ascii());
+    let name_chars = name.chars().count() as u16;
+    let full_w = name_chars * HERO_GLYPH_COLS_PER_CHAR;
+    let narrow_w = name_chars * HERO_GLYPH_COLS_PER_CHAR_NARROW;
+    let name_glyph_tier = if !ascii_name {
+        None
+    } else if full_w <= content.width && content.height >= HERO_NAME_GLYPH_ROWS {
+        Some((PixelSize::Full, HERO_NAME_GLYPH_ROWS))
+    } else if narrow_w <= content.width && content.height >= HERO_GLYPH_ROWS {
+        Some((PixelSize::Quadrant, HERO_GLYPH_ROWS))
+    } else {
+        None
+    };
+
+    match name_glyph_tier {
+        Some((pixel_size, glyph_rows)) => {
+            let glyph = BigText::builder()
+                .pixel_size(pixel_size)
+                .style(name_style)
+                .alignment(Alignment::Center)
+                .lines(vec![Line::from(name.to_string())])
+                .build();
+            f.render_widget(glyph, center_v(rows[0], glyph_rows.min(rows[0].height)));
+        }
+        None => {
+            let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+            let name_text = if spaced.chars().count() as u16 <= content.width { spaced } else { name.to_string() };
+            f.render_widget(
+                Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
+                center_v(rows[0], 1),
+            );
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
+        center_v(rows[2], 1),
+    );
+}
+
+/// Renders the current-prompt hero panel as three bordered subsections —
+/// Heading/Subheading, Notes, Detected — stacked in one column and spread
+/// evenly across the panel's full height via three equal `Fill(1)` rows
+/// with identical gaps between them (`HERO_SECTION_GAP`). Previously these
+/// three lived at a fixed content height stacked at the panel's top, which
+/// either centered as one block (leaving a large dead gap above the
+/// heading) or top-anchored (stranding a large dead gap below the
+/// Detected box, outside any visible boundary) — both were the
+/// most-reported issue. Now `draw_practice` sizes the panel itself to
+/// fill the available column, so the three subsections — each its own
+/// clearly bounded "card" — always occupy the panel's real height with no
+/// unbounded space left over.
+fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
+        .title(Span::styled(
+            format!(" {} ", ui.prompt_kind),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(HERO_TOP_MARGIN),
+            Constraint::Min(HERO_SECTION_MIN_H),
+            Constraint::Length(HERO_SECTION_GAP),
+            Constraint::Min(HERO_SECTION_MIN_H),
+            Constraint::Length(HERO_SECTION_GAP),
+            Constraint::Min(HERO_SECTION_MIN_H),
+            Constraint::Length(HERO_BOTTOM_MARGIN),
+        ])
+        .split(inner);
+    let heading_section = sections[1];
+    let notes_section = sections[3];
+    let detected_section = sections[5];
+
+    render_heading_box(f, heading_section, ui, theme);
+
+    // Notes and Detected each get their own bordered box spanning the full
+    // section — the same treatment as the Heading box — so all three read
+    // as visually consistent, equally-sized cards. Their actual content
+    // (the target chips, the detected-note text) stays the same fixed,
+    // capped size as before and is centered inside that box; only the
+    // surrounding frame now grows with the section instead of hugging the
+    // content tightly and leaving unbordered dead space around it.
+    let notes_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
+        .title(" Notes ");
+    let notes_inner = notes_block.inner(notes_section);
+    f.render_widget(notes_block, notes_section);
+    let notes_h = HERO_CHIP_H.min(notes_inner.height);
+    render_targets_row(f, center_v(notes_inner, notes_h), ui, theme);
+
+    render_detected_indicator(f, detected_section, ui, theme);
+}
+
+#[cfg(test)]
+mod detected_correctness_tests {
+    use super::*;
+
+    fn ui_with(targets: &[&str], matched: &[bool], ordered: bool, detected: Option<&str>) -> UiState {
+        UiState {
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            matched_indices: matched.to_vec(),
+            ordered,
+            detected_note: detected.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unordered_correct_when_any_unmatched_target_sounds() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[false, true, false], false, Some("C3"));
+        assert_eq!(detected_correctness(&ui), Some(true));
+    }
+
+    #[test]
+    fn unordered_wrong_when_note_is_not_a_target() {
+        let ui = ui_with(&["A2", "B2"], &[false, false], false, Some("D3"));
+        assert_eq!(detected_correctness(&ui), Some(false));
+    }
+
+    #[test]
+    fn unordered_wrong_when_note_is_an_already_matched_target() {
+        // A2 was already accepted; hearing it again isn't "still needed".
+        let ui = ui_with(&["A2", "B2"], &[true, false], false, Some("A2"));
+        assert_eq!(detected_correctness(&ui), Some(false));
+    }
+
+    #[test]
+    fn ordered_only_the_next_target_counts() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[true, false, false], true, Some("C3"));
+        // next required is B2 (index 1); C3 is a target but out of order.
+        assert_eq!(detected_correctness(&ui), Some(false));
+        let ui2 = ui_with(&["A2", "B2", "C3"], &[true, false, false], true, Some("B2"));
+        assert_eq!(detected_correctness(&ui2), Some(true));
+    }
+
+    #[test]
+    fn none_when_nothing_detected() {
+        let ui = ui_with(&["A2"], &[false], false, None);
+        assert_eq!(detected_correctness(&ui), None);
+    }
+}
+
+/// Where the Session panel (or its collapsed fallback) lands on the
+/// Practice screen — depends on the wide/narrow/short thresholds below.
+enum SessionSlot {
+    Panel(Rect),
+    Line(Rect),
 }
 
 fn draw_practice(
@@ -651,123 +1476,107 @@ fn draw_practice(
     settings: &SettingsState,
     theme: &Theme,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
+    let wide = is_wide(area);
 
-    // Prompt block.
-    let prompt_block = Block::default().borders(Borders::ALL).title(Span::styled(
-        format!(" {} ", ui.prompt_kind),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    let success_style = Style::default().fg(parse_color(&theme.success, Color::Green));
-    let targets_line: Line = if ui.ordered {
-        let mut spans = vec![Span::raw(format!("[{}/{}]  ", ui.matched, ui.targets.len()))];
-        for (i, t) in ui.targets.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" → "));
-            }
-            if ui.matched_indices.get(i).copied().unwrap_or(false) {
-                spans.push(Span::styled(t.clone(), success_style));
-            } else {
-                spans.push(Span::raw(t.clone()));
-            }
-        }
-        Line::from(spans)
+    let (hero_area, timer_area, action_area, slot) = if wide {
+        // Wide: two columns — prompt/timer/actions on the left, a
+        // full-height Session panel (score, device, tuning, categories,
+        // recent attempts) on the right. Hero now fills the available
+        // column height (rather than a fixed content budget with a
+        // separate spacer below it) so its three subsections — Heading,
+        // Notes, Detected — can spread evenly across the panel's real
+        // height; see `render_hero_prompt`.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+            .split(area);
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Length(6), Constraint::Length(3)])
+            .split(cols[0]);
+        (left[0], left[1], left[2], SessionSlot::Panel(cols[1]))
+    } else if is_short(area) {
+        // Narrow AND short: no room for a panel — collapse to the single
+        // score/device line the screen has always shown here. Terminal is
+        // already tight, so hero keeps claiming whatever's left rather
+        // than a fixed budget that might not fit.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .split(area);
+        (rows[0], rows[1], rows[3], SessionSlot::Line(rows[2]))
     } else {
-        let mut spans = vec![Span::raw(format!("{}  ", ui.matched))];
-        for (i, t) in ui.targets.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" "));
-            }
-            if ui.matched_indices.get(i).copied().unwrap_or(false) {
-                spans.push(Span::styled(format!("[✓{}]", t), success_style));
-            } else {
-                spans.push(Span::raw(format!("[  {}]", t)));
-            }
-        }
-        Line::from(spans)
+        // Narrow but tall enough: single column, with the Session panel
+        // (compact — no categories line) dropped beneath the action bar.
+        // Hero and the Session panel now split remaining height evenly
+        // (both `Fill(1)`) instead of hero taking a fixed budget and the
+        // panel absorbing 100% of what's left — same reasoning as the
+        // wide branch: hero's three subsections spread across its real
+        // height rather than a fixed content box.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(6),
+                Constraint::Length(3),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+        (rows[0], rows[2], rows[3], SessionSlot::Panel(rows[4]))
     };
-    let p = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(ui.prompt_display.clone()),
-        Line::from(""),
-        targets_line,
-    ])
-    .block(prompt_block)
-    .alignment(Alignment::Center)
-    .wrap(Wrap { trim: true });
-    f.render_widget(p, chunks[0]);
 
-    // Timer (L) + detected note (R).
-    let mid = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+    render_hero_prompt(f, hero_area, ui, theme);
+
+    // Timer — full width. The Detected indicator now lives directly under
+    // the target-note chips inside the hero panel (see
+    // `render_detected_indicator`), not squeezed into half of this row.
     let gauge_color = if ui.time_left_secs <= 5 {
-        parse_color(&theme.danger, Color::Red)
+        theme_color(&theme.danger, Color::Red)
     } else {
-        parse_color(&theme.success, Color::Green)
+        theme_color(&theme.success, Color::Green)
     };
+    let timer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
+        .title(" Timer ");
+    let timer_inner = timer_block.inner(timer_area);
+    f.render_widget(timer_block, timer_area);
+    let timer_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
+        .split(timer_inner);
     let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title(" Timer "))
         .gauge_style(Style::default().fg(gauge_color))
         .ratio(ui.time_left_frac)
-        .label(format!("{}s / {}s", ui.time_left_secs, ui.prompt_secs));
-    f.render_widget(gauge, mid[0]);
-    let detected_text = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
-    // During the post-match cooldown, blink the Detected panel (alternating
-    // reversed/success and plain accent styles every 200ms) as an obvious
-    // "matched, hold on" cue; otherwise render with the plain accent style.
-    let accent_style = Style::default().fg(parse_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
-    let cooldown_active = ui
-        .cooldown_started
-        .map(|t| t.elapsed() < Duration::from_millis(ui.cooldown_ms))
-        .unwrap_or(false);
-    let detected_style = if cooldown_active {
-        let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200) % 2 == 0;
-        if blink_on {
-            success_style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            accent_style
-        }
-    } else {
-        accent_style
-    };
-    let det = Paragraph::new(format!(" {}", detected_text))
-        .block(Block::default().borders(Borders::ALL).title(" Detected "))
-        .style(detected_style);
-    f.render_widget(det, mid[1]);
+        .label(Span::styled(
+            format!("{}s / {}s", ui.time_left_secs, ui.prompt_secs),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(gauge, timer_rows[1]);
 
-    // Score + device line.
-    let device_name = settings
-        .audio_device
-        .clone()
-        .unwrap_or_else(|| "(default mic)".to_string());
-    let score_line = Paragraph::new(format!(
-        "✓ {}/{}   device: {}",
-        ui.score_passed, ui.score_total, device_name
-    ))
-    .alignment(Alignment::Center)
-    .style(Style::default().fg(parse_color(&theme.secondary, Color::Cyan)));
-    f.render_widget(score_line, chunks[2]);
-
-    // Footer action bar: Stop / Skip / Settings, current one highlighted.
+    // Footer action bar: Stop / Skip / Settings. The highlighted action
+    // gets a filled background pill plus a "‣ " marker and underline (the
+    // same marker the vertical menus use) so the current selection is
+    // unmistakable at a glance, not just a subtle color shift.
     let mut spans = Vec::new();
     for (i, label) in PRACTICE_ACTIONS.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw("    "));
+            spans.push(Span::raw("     "));
         }
         if i == app.practice_idx {
-            spans.push(Span::styled(format!(" {label} "), selection_style(theme)));
+            spans.push(Span::styled(
+                format!(" ‣ {label} "),
+                selection_style(theme).add_modifier(Modifier::UNDERLINED),
+            ));
         } else {
-            spans.push(Span::raw(format!(" {label} ")));
+            spans.push(Span::raw(format!("   {label} ")));
         }
     }
     let footer = Paragraph::new(Line::from(spans))
@@ -775,17 +1584,55 @@ fn draw_practice(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
                 .title(" ←→ select, Enter to activate "),
         );
-    f.render_widget(footer, chunks[3]);
+    f.render_widget(footer, action_area);
+
+    match slot {
+        SessionSlot::Panel(rect) => render_session_panel(f, rect, ui, settings, theme, wide),
+        SessionSlot::Line(rect) => {
+            let device_name = settings
+                .audio_device
+                .clone()
+                .unwrap_or_else(|| "(default mic)".to_string());
+            let line = Paragraph::new(format!(
+                "✓ {}/{}   device: {}",
+                ui.score_passed, ui.score_total, device_name
+            ))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)));
+            f.render_widget(line, rect);
+        }
+    }
 }
 
 fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
-    let block = Block::default().borders(Borders::ALL).title(
-        " Settings — ↑↓ select, Enter to toggle/edit, Esc to save & back ",
-    );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Settings — ↑↓ select, Enter to toggle/edit, Esc to save & back ");
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let list_h = (SETTINGS_ROW_COUNT as u16).min(inner.height);
+    let wide = is_wide(area);
+
+    // List stays top-aligned at its natural content height instead of
+    // stretching into the full remaining area — stretching a `List` doesn't
+    // fill it with anything, it just leaves blank rows below the last item.
+    let rows = if wide {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_h), Constraint::Length(1), Constraint::Fill(1)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_h), Constraint::Fill(1), Constraint::Length(1)])
+            .split(inner)
+    };
 
     let items: Vec<ListItem> = (0..SETTINGS_ROW_COUNT)
         .map(|i| ListItem::new(settings_row_label(i, app, settings)))
@@ -795,7 +1642,85 @@ fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &S
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.settings_idx));
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, rows[0], &mut state);
+
+    if wide {
+        let divider = "─".repeat(rows[1].width as usize);
+        f.render_widget(
+            Paragraph::new(Span::styled(divider, Style::default().fg(Color::DarkGray))),
+            rows[1],
+        );
+        render_settings_help(f, rows[2], app, settings, theme);
+    } else {
+        f.render_widget(
+            Paragraph::new("↑↓ select · Enter toggle/edit · Esc save & back")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+            rows[2],
+        );
+    }
+}
+
+/// One-line-to-paragraph contextual help for whichever Settings row is
+/// currently highlighted — fills the space the old fixed-height list left
+/// blank below its last item with something the highlighted row can
+/// actually use.
+fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+    let body = match app.settings_idx {
+        0 => "How long a prompt stays on screen before it times out. Longer gives more time to \
+              find every target note."
+            .to_string(),
+        1 => format!(
+            "Open strings, low → high: {}",
+            tuning_strings_label(settings.tuning)
+        ),
+        2 => "When ON, each new prompt draws uniformly at random from the enabled categories \
+              below, instead of cycling through them in order."
+            .to_string(),
+        3..=9 => {
+            let (c, _) = &settings.enabled[app.settings_idx - 3];
+            category_help(*c).to_string()
+        }
+        10 => format!(
+            "{} input device(s) found. Press Enter to rescan and choose one.",
+            app.devices.len()
+        ),
+        11 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
+              library. Leave empty to use only the built-in content."
+            .to_string(),
+        12 => "Save every change above and return to where you started.".to_string(),
+        _ => String::new(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" About ");
+    let p = Paragraph::new(body)
+        .block(block)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)));
+    f.render_widget(p, area);
+}
+
+fn tuning_strings_label(tuning: TuningId) -> String {
+    tuning
+        .open_strings()
+        .iter()
+        .map(|&m| Note::from_midi_clamped(m).name())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn category_help(c: ChallengeType) -> &'static str {
+    match c {
+        ChallengeType::Note => "Single open or fretted notes — the fastest way to drill raw fretboard recall.",
+        ChallengeType::Chord => "A full chord voicing from a random root and quality; every note in the shape must sound.",
+        ChallengeType::Scale => "A scale run from a random root, matched in ascending order.",
+        ChallengeType::Mode => "A modal scale run from a random root, matched in ascending order.",
+        ChallengeType::Progression => "A chord-degree progression (e.g. I–IV–V) in a random key, matched in order.",
+        ChallengeType::Lick => "A short pre-written phrase from the content library, matched in order.",
+        ChallengeType::Piece => "An excerpt from a longer piece in the content library, matched in order.",
+    }
 }
 
 fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
@@ -835,9 +1760,10 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
 }
 
 fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
-    let block = Block::default().borders(Borders::ALL).title(
-        " Audio Device — ↑↓ select, Enter to choose, Esc to cancel ",
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Audio Device — ↑↓ select, Enter to choose, Esc to cancel ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -857,10 +1783,20 @@ fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings:
         items.push(ListItem::new(label));
     }
 
+    // Top-align at natural content height + a `Fill` spacer below — same
+    // dead-space fix as Settings, no contextual help panel (nothing
+    // meaningfully contextual to show per-device beyond the name already
+    // visible).
+    let list_h = (items.len() as u16).min(inner.height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_h), Constraint::Fill(1)])
+        .split(inner);
+
     let list = List::new(items)
         .highlight_style(selection_style(theme))
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.device_idx));
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, rows[0], &mut state);
 }
