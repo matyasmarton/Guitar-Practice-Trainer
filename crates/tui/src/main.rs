@@ -697,9 +697,12 @@ fn is_short(area: Rect) -> bool {
 // fills its whole section directly, same as Heading's border does.
 // ---------------------------------------------------------------------------
 const HERO_TOP_MARGIN: u16 = 1;
-/// Reserved for the prompt name regardless of length, keeping the
-/// heading box's content height stable across prompts.
-const HERO_NAME_H: u16 = 4;
+/// Reserved for the prompt name regardless of length — sized to the
+/// tallest glyph tier the name can render at (`PixelSize::Full`, 8 rows;
+/// see `HERO_NAME_GLYPH_ROWS`), keeping the heading box's content height
+/// stable across prompts whether or not a given name qualifies for glyph
+/// rendering.
+const HERO_NAME_H: u16 = 8;
 const HERO_GAP1: u16 = 1;
 const HERO_CAPTION_H: u16 = 1;
 /// Fixed content height of the heading+subheading group (name + internal
@@ -717,19 +720,38 @@ const HERO_BOTTOM_MARGIN: u16 = 1;
 /// margins" between the three, per the one-column/3-row layout request).
 const HERO_SECTION_GAP: u16 = 2;
 
-/// Terminal rows/columns spanned by one glyph of the enlarged note-value
-/// text used for the note chips and the Detected value — rendered via
-/// `tui_big_text` at `PixelSize::HalfHeight` (not `Quadrant`, which was
-/// tried here before and rejected as too chunky/angular: both are 4 rows
-/// tall, but `HalfHeight` samples twice the horizontal detail per
-/// character, so diagonal strokes step more finely and read softer). Built
-/// from the same safe Block Elements range (▀▄█, U+2580-259F) already
-/// verified glitch-free in this terminal — see the Sextant→HalfHeight
-/// caption fix. Scoped to the note values only; the heading name/caption
-/// stay the existing crisp single-row text, which is where long prose
-/// (e.g. "B2 Mixolydian") was specifically hard to read as glyph text.
+/// Terminal rows/columns spanned by one glyph of the note-chip / Detected
+/// value text, rendered via `tui_big_text` at `PixelSize::HalfHeight` (not
+/// `Quadrant`, which was tried here before and rejected as too
+/// chunky/angular: both are 4 rows tall, but `HalfHeight` samples twice
+/// the horizontal detail per character, so diagonal strokes step more
+/// finely and read softer). Built from the same safe Block Elements range
+/// (▀▄█, U+2580-259F) already verified glitch-free in this terminal — see
+/// the Sextant→HalfHeight caption fix.
 const HERO_GLYPH_ROWS: u16 = 4;
 const HERO_GLYPH_COLS_PER_CHAR: u16 = 8;
+/// Narrower fallback tier (`PixelSize::Quadrant`) for content that won't
+/// fit `HERO_GLYPH_COLS_PER_CHAR`'s width at the given terminal size —
+/// half the columns per glyph, same `HERO_GLYPH_ROWS` height. Used so a
+/// wide chord/scale's chip row (many simultaneous targets) still renders
+/// as glyph text at *some* size instead of silently dropping to plain
+/// crisp text while a 1-2 target prompt next to it renders full-size —
+/// that per-prompt size flip was the reported "chip font inconsistent"
+/// bug. Plain text remains the last-resort fallback only for the rare
+/// case that doesn't fit even this tier.
+const HERO_GLYPH_COLS_PER_CHAR_NARROW: u16 = 4;
+/// Row height of the prompt name at `PixelSize::Full` (8 rows — literally
+/// double `HERO_GLYPH_ROWS`, matching the requested ~56pt-heading vs
+/// ~36pt-chip size relationship while keeping the same
+/// `HERO_GLYPH_COLS_PER_CHAR`-wide, softest-available horizontal
+/// resolution). `render_heading_box` only uses it for names that are pure
+/// ASCII: `font8x8::BASIC_FONTS` (the glyph table `tui_big_text` renders
+/// from) has no entry for the en dash `–` used in every Progression name
+/// ("I–IV–V–I in A2"), so glyph mode would silently render those dashes
+/// as blank cells — the same class of bug already hit and fixed for the
+/// idle "—" Detected placeholder. Progression names fall back to the
+/// existing crisp letter-spaced text instead.
+const HERO_NAME_GLYPH_ROWS: u16 = 8;
 
 /// Dot-separated list of the currently enabled challenge categories, e.g.
 /// "Note · Chord · Scale". Shown on the Menu and Practice session panels so
@@ -983,18 +1005,20 @@ fn render_thick_rounded_border(f: &mut ratatui::Frame<'_>, area: Rect, style: St
 /// information during practice, and the hero panel's largest, boldest
 /// element. Each target is its own hand-drawn chip: a heavier-weight
 /// rounded border (`render_thick_rounded_border`, per the "thicker chip
-/// border" request) framing the note value rendered at
-/// `PixelSize::HalfHeight` — 4 terminal rows tall, the middle ground
-/// between the previous single-row crisp text (too small) and the full
-/// block-glyph rendering tried earlier in this file (too chunky/retro for
-/// prose, but fine for a 2-4 character note token — it reads like a
-/// tuner/pedal LCD digit, which fits the app). A checkmark glyph isn't in
-/// the underlying 8x8 font, so match state is carried by color alone
-/// (border + text turn green), the same convention already used by
-/// `render_detected_indicator`. Falls back to the previous single-row
-/// crisp letter-spaced text whenever the glyph rendering wouldn't fit the
-/// available width/height (narrow terminals, many simultaneous targets),
-/// so nothing is ever clipped. Ordered prompts chain the chips with an
+/// border" request) framing the note value rendered as glyph text. Tries
+/// `PixelSize::HalfHeight` first (the approved "36pt" chip size); if the
+/// full chip row wouldn't fit at that width (many simultaneous targets —
+/// a 6-7 note scale/mode), steps down to the narrower `PixelSize::Quadrant`
+/// tier instead of dropping straight to small crisp text. This is what
+/// fixes the reported bug where a 1-2 target prompt rendered big glyphs
+/// but a many-target prompt silently fell back to tiny plain text right
+/// next to it — every target count now gets *some* glyph tier at the same
+/// two sizes, so chip weight reads consistently across prompts; only a
+/// genuinely extreme case (very narrow terminal, many long labels) still
+/// falls back to plain text so nothing is ever clipped. A checkmark glyph
+/// isn't in the underlying 8x8 font, so match state is carried by color
+/// alone (border + text turn green), the same convention already used by
+/// `render_detected_indicator`. Ordered prompts chain the chips with an
 /// arrow so the required sequence reads left to right; unordered prompts
 /// space them evenly.
 fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
@@ -1023,21 +1047,25 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     // Glyph cells already have their own built-in per-character padding
     // (the 8x8 font's own spacing), so — unlike the crisp fallback, which
     // needs manual letter-spacing to avoid reading cramped — glyph labels
-    // skip it: keeps chips narrower, so more simultaneous targets (a
-    // 4-note progression/chord) actually qualify for the bigger glyph
-    // rendering instead of falling back.
+    // skip it: keeps chips narrower, so more simultaneous targets qualify
+    // for glyph rendering instead of falling back.
     let glyph_labels: Vec<String> = ui.targets.iter().map(|t| t.clone()).collect();
+    let max_glyph_chars = glyph_labels.iter().map(|l| l.chars().count() as u16).max().unwrap_or(1);
 
     let plain_box_w = plain_labels.iter().map(|l| l.chars().count() as u16 + 6).max().unwrap_or(1);
-    let glyph_box_w = glyph_labels
-        .iter()
-        .map(|l| l.chars().count() as u16 * HERO_GLYPH_COLS_PER_CHAR + 6)
-        .max()
-        .unwrap_or(1);
-    let glyph_content_w = glyph_box_w * n + gap_w * n.saturating_sub(1);
-    let use_glyphs = glyph_content_w <= area.width && area.height >= HERO_GLYPH_ROWS + 2;
+    let full_box_w = max_glyph_chars * HERO_GLYPH_COLS_PER_CHAR + 6;
+    let narrow_box_w = max_glyph_chars * HERO_GLYPH_COLS_PER_CHAR_NARROW + 6;
+    let fits_height = area.height >= HERO_GLYPH_ROWS + 2;
+    let full_fits = fits_height && full_box_w * n + gap_w * n.saturating_sub(1) <= area.width;
+    let narrow_fits = fits_height && narrow_box_w * n + gap_w * n.saturating_sub(1) <= area.width;
 
-    let box_w = if use_glyphs { glyph_box_w } else { plain_box_w };
+    let (box_w, glyph_pixel_size) = if full_fits {
+        (full_box_w, Some(PixelSize::HalfHeight))
+    } else if narrow_fits {
+        (narrow_box_w, Some(PixelSize::Quadrant))
+    } else {
+        (plain_box_w, None)
+    };
     let content_w = (box_w * n + gap_w * n.saturating_sub(1)).min(area.width);
 
     let outer = Layout::default()
@@ -1073,9 +1101,9 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         ci += 1;
         let (border_style, text_style) = if matched { (success, success) } else { (idle_border, idle_text) };
         let inner = render_thick_rounded_border(f, rect, border_style);
-        if use_glyphs {
+        if let Some(pixel_size) = glyph_pixel_size {
             let glyph = BigText::builder()
-                .pixel_size(PixelSize::HalfHeight)
+                .pixel_size(pixel_size)
                 .style(text_style)
                 .alignment(Alignment::Center)
                 .lines(vec![Line::from(glyph_labels[i].clone())])
@@ -1189,11 +1217,18 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
 /// The prompt name + match-count caption, boxed as its own bordered
 /// subsection — the sibling of the Notes chips and the Detected box, all
 /// three now spread evenly inside the hero panel (see `render_hero_prompt`).
-/// Both the name and the caption render as bold, letter-spaced real text —
-/// no block-glyph big text — so the type stays crisp and modern instead of
-/// reading as a pixelated retro LCD font; a long Lick/Piece name still
-/// degrades from letter-spaced to tight spacing if it wouldn't otherwise
-/// fit the box width.
+/// The name renders as glyph text one size class above the note chips
+/// (`PixelSize::Full`, 8 rows, falling back to `Quadrant`, 4 rows, if the
+/// name is too wide — the same two-tier system `render_targets_row` uses),
+/// so heading and chip weight read as one consistent, deliberately-scaled
+/// family instead of one being glyph text and the other plain. Names
+/// containing non-ASCII characters — every Progression display contains
+/// the en dash `–` ("I–IV–V–I in A2"), which has no glyph in the
+/// `font8x8::BASIC_FONTS` table `tui_big_text` renders from — skip glyph
+/// mode entirely and keep the existing crisp letter-spaced text, since
+/// glyph mode would silently render those dashes as blank cells. The
+/// caption stays crisp, single-row text at all times: it's a short
+/// fixed-format status line ("N OF M MATCHED"), not the prompt's headline.
 fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1229,12 +1264,43 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         .constraints([Constraint::Length(HERO_NAME_H), Constraint::Length(HERO_GAP1), Constraint::Length(HERO_CAPTION_H)])
         .split(content);
 
-    let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-    let name_text = if spaced.chars().count() as u16 <= content.width { spaced } else { name.to_string() };
-    f.render_widget(
-        Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
-        center_v(rows[0], 1),
-    );
+    // Glyph labels skip manual letter-spacing (the 8x8 font already has
+    // its own per-character padding), same reasoning as the chip labels —
+    // keeps more names qualifying for the bigger tier instead of falling
+    // back.
+    let ascii_name = !name.is_empty() && name.chars().all(|c| c.is_ascii());
+    let name_chars = name.chars().count() as u16;
+    let full_w = name_chars * HERO_GLYPH_COLS_PER_CHAR;
+    let narrow_w = name_chars * HERO_GLYPH_COLS_PER_CHAR_NARROW;
+    let name_glyph_tier = if !ascii_name {
+        None
+    } else if full_w <= content.width && content.height >= HERO_NAME_GLYPH_ROWS {
+        Some((PixelSize::Full, HERO_NAME_GLYPH_ROWS))
+    } else if narrow_w <= content.width && content.height >= HERO_GLYPH_ROWS {
+        Some((PixelSize::Quadrant, HERO_GLYPH_ROWS))
+    } else {
+        None
+    };
+
+    match name_glyph_tier {
+        Some((pixel_size, glyph_rows)) => {
+            let glyph = BigText::builder()
+                .pixel_size(pixel_size)
+                .style(name_style)
+                .alignment(Alignment::Center)
+                .lines(vec![Line::from(name.to_string())])
+                .build();
+            f.render_widget(glyph, center_v(rows[0], glyph_rows.min(rows[0].height)));
+        }
+        None => {
+            let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+            let name_text = if spaced.chars().count() as u16 <= content.width { spaced } else { name.to_string() };
+            f.render_widget(
+                Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
+                center_v(rows[0], 1),
+            );
+        }
+    }
 
     f.render_widget(
         Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
