@@ -1542,11 +1542,25 @@ fn strip_octave(name: &str) -> &str {
 /// what that tuning produces on that string/fret — no hand-maintained note
 /// table to drift out of sync when a tuning changes.
 ///
+/// Sized via a tier ladder (largest-that-fits `inner.width`, same
+/// fit-check discipline `render_targets_row` uses for its chip tiers)
+/// instead of one fixed cell width: a wide terminal gets bigger columns
+/// and letter-spaced note text ("A#2" → "A # 2", the same crisp-text
+/// convention used for the hero chips/heading) for an easier read, while
+/// a terminal near `WIDE_COLS` falls back to the original dense/unspaced
+/// layout rather than asking the `Table` widget for more column width
+/// than it has — which would silently compress columns unevenly. The
+/// whole block (table + legend) is then vertically centered in the
+/// panel, so a tall terminal no longer leaves the board stranded at the
+/// top with dead space below it.
+///
 /// `settings.fretboard_highlight` selects the mode: off shows a plain
 /// static reference (every cell in `theme.secondary`); on colors/bolds the
 /// cells matching `active_target_names(ui)` (the current prompt's
 /// still-needed target notes) in `theme.accent`, clearing automatically as
-/// `ui` advances prompt to prompt.
+/// `ui` advances prompt to prompt. A one-line legend below the board (shown
+/// whenever there's vertical room to spare) explains the fret-marker dots
+/// and, in highlight mode, what the accent color means.
 fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settings: &SettingsState, theme: &Theme) {
     let tuning = settings.tuning;
     let block = Block::default()
@@ -1566,26 +1580,57 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
     // short of the second double-dot fret (24) a 24-fret board would have.
     const FRET_MARKERS: [u8; 8] = [3, 5, 7, 9, 15, 17, 19, 21];
     const FRET_DOUBLE_MARKER: u8 = 12;
-    const GUTTER_W: u16 = 4; // fits "12●●"
-    const STRING_COL_W: u16 = 4; // fits "A#2 "
-    let table_width = GUTTER_W + STRING_COL_W * 6;
+
+    struct Tier {
+        gutter_w: u16,
+        string_col_w: u16,
+        spacing: u16,
+        spaced_text: bool,
+    }
+    // Largest first: spacious letter-spaced columns, a medium letter-spaced
+    // step-down, then the original dense/unspaced layout as the floor —
+    // every tier's total width is exact (gutter + 6 string columns + the 6
+    // inter-column gaps `column_spacing` inserts), so whichever one is
+    // picked fits `inner.width` with no leftover deficit for the `Table`
+    // widget's own constraint solver to silently shrink away.
+    const TIERS: [Tier; 3] = [
+        Tier { gutter_w: 5, string_col_w: 7, spacing: 2, spaced_text: true },
+        Tier { gutter_w: 5, string_col_w: 6, spacing: 1, spaced_text: true },
+        Tier { gutter_w: 4, string_col_w: 4, spacing: 1, spaced_text: false },
+    ];
+    let tier_width = |t: &Tier| t.gutter_w + t.string_col_w * 6 + t.spacing * 6;
+    let tier = TIERS.iter().find(|t| tier_width(t) <= inner.width).unwrap_or(&TIERS[2]);
+    let table_width = tier_width(tier).min(inner.width);
 
     // 1 header row (string letters) + as many fret rows as fit, starting
     // from the open strings (fret 0) — never more than FRET_COUNT frets.
-    let available_fret_rows = inner.height.saturating_sub(1);
-    let frets_shown = available_fret_rows.min(FRET_COUNT as u16 + 1);
+    let frets_shown = inner.height.saturating_sub(1).min(FRET_COUNT as u16 + 1);
     if frets_shown == 0 {
         return; // too short even for one fret row — block/title still drew.
     }
+    let content_h = 1 + frets_shown;
+
+    // Legend explaining the fret-marker dots (and, in highlight mode, the
+    // accent color) — only claimed when there's genuine slack beyond the
+    // table itself, so it never steals a row a shorter terminal needs to
+    // show another fret.
+    let show_legend = inner.height >= content_h + 2;
+    let block_h = if show_legend { content_h + 2 } else { content_h };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(table_width.min(inner.width)),
-            Constraint::Fill(1),
-        ])
+        .constraints([Constraint::Fill(1), Constraint::Length(table_width), Constraint::Fill(1)])
         .split(inner);
+    let centered = center_v(cols[1], block_h);
+    let (table_area, legend_area) = if show_legend {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(content_h), Constraint::Length(1), Constraint::Length(1)])
+            .split(centered);
+        (rows[0], Some(rows[2]))
+    } else {
+        (centered, None)
+    };
 
     let header_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
     let open_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
@@ -1599,11 +1644,16 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
         Vec::new()
     };
 
-    let header = Row::new(std::iter::once(Cell::from("Fr")).chain(tuning.open_strings().iter().map(|&m| {
-        let name = Note::from_midi_clamped(m).name();
-        Cell::from(strip_octave(&name).to_string())
-    })))
-    .style(header_style);
+    let spaced = |s: &str| -> String { s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
+    let label = |s: &str| -> String { if tier.spaced_text { spaced(s) } else { s.to_string() } };
+    let centered_cell = |text: String, style: Style| Cell::from(Line::from(text).alignment(Alignment::Center)).style(style);
+
+    let header = Row::new(std::iter::once(centered_cell("Fr".to_string(), header_style)).chain(
+        tuning.open_strings().iter().map(|&m| {
+            let name = Note::from_midi_clamped(m).name();
+            centered_cell(label(strip_octave(&name)), header_style)
+        }),
+    ));
 
     let rows: Vec<Row> = (0..frets_shown as u8)
         .map(|fret| {
@@ -1615,21 +1665,32 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
                 ""
             };
             let row_style = if fret == 0 { open_style } else { note_style };
-            let gutter = Cell::from(format!("{fret}{marker}")).style(gutter_style);
+            let gutter = centered_cell(format!("{fret}{marker}"), gutter_style);
             let string_cells = (0..6usize).map(|s| {
                 let name = string_note(tuning, s, fret).map(|n| n.name()).unwrap_or_else(|| "-".to_string());
                 let cell_style = if active.contains(&name.as_str()) { highlight_style } else { row_style };
-                Cell::from(name).style(cell_style)
+                centered_cell(label(&name), cell_style)
             });
             Row::new(std::iter::once(gutter).chain(string_cells))
         })
         .collect();
 
-    let widths: Vec<Constraint> = std::iter::once(Constraint::Length(GUTTER_W))
-        .chain(std::iter::repeat(Constraint::Length(STRING_COL_W)).take(6))
+    let widths: Vec<Constraint> = std::iter::once(Constraint::Length(tier.gutter_w))
+        .chain(std::iter::repeat(Constraint::Length(tier.string_col_w)).take(6))
         .collect();
-    let table = Table::new(rows, widths).header(header);
-    f.render_widget(table, cols[1]);
+    let table = Table::new(rows, widths).header(header).column_spacing(tier.spacing);
+    f.render_widget(table, table_area);
+
+    if let Some(legend_area) = legend_area {
+        let mut spans = vec![Span::styled("●", gutter_style), Span::raw(" fret marker")];
+        if settings.fretboard_highlight {
+            spans.push(Span::raw("     "));
+            spans.push(Span::styled("●", highlight_style));
+            spans.push(Span::raw(" still-needed target"));
+        }
+        let legend = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+        f.render_widget(legend, legend_area);
+    }
 }
 
 /// Where the Session panel (or its collapsed fallback) lands on the
