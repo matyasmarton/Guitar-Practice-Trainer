@@ -719,6 +719,22 @@ const HERO_BOTTOM_MARGIN: u16 = 1;
 /// constant so every gap between rows is identical ("even padding and
 /// margins" between the three, per the one-column/3-row layout request).
 const HERO_SECTION_GAP: u16 = 2;
+/// Floor on each hero subsection's own height (Heading, Notes, Detected),
+/// used instead of a bare `Constraint::Fill(1)` for the three-way split in
+/// `render_hero_prompt`. Two rows of border plus at least one content row
+/// (3) is the least a chip needs to show its label at all — below that,
+/// `render_thick_rounded_border`/`center_v` collapse to a zero-height
+/// inner rect and the label silently vanishes while the section's own
+/// outer border keeps drawing, which read as a total rendering failure.
+/// Splitting hero's height with three bare `Fill(1)`s (further nested
+/// inside `draw_practice`'s own `Fill(1)` sharing with the Session panel)
+/// meant each subsection's actual height was two layers of floor-division
+/// remainder away from the terminal's row count — non-monotonic, so a
+/// *taller* terminal could land on a *worse* remainder than a shorter one.
+/// `Constraint::Min` still grows a section past this floor when the
+/// terminal has room, but never lets one drop below it while any of that
+/// two-layer remainder math has slack to give.
+const HERO_SECTION_MIN_H: u16 = 5;
 
 /// Terminal rows/columns spanned by one glyph of the note-chip / Detected
 /// value text, rendered via `tui_big_text` at `PixelSize::HalfHeight` (not
@@ -1362,11 +1378,11 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(HERO_TOP_MARGIN),
-            Constraint::Fill(1),
+            Constraint::Min(HERO_SECTION_MIN_H),
             Constraint::Length(HERO_SECTION_GAP),
-            Constraint::Fill(1),
+            Constraint::Min(HERO_SECTION_MIN_H),
             Constraint::Length(HERO_SECTION_GAP),
-            Constraint::Fill(1),
+            Constraint::Min(HERO_SECTION_MIN_H),
             Constraint::Length(HERO_BOTTOM_MARGIN),
         ])
         .split(inner);
