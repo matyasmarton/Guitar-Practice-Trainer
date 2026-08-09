@@ -7,7 +7,7 @@
 //! surfaces note names only; a fretboard diagram is deferred (see plan).
 
 use crate::note::{Note, MIDI_MAX, MIDI_MIN};
-use crate::tuning::{TuningId, FRET_COUNT};
+use crate::tuning::{Tuning, FRET_COUNT};
 
 // ---------------------------------------------------------------------------
 // Chord qualities
@@ -196,8 +196,8 @@ impl Mode {
 /// every output is a real fretted pitch reachable on `tuning` — each note is
 /// clamped to its own string's `open..=open+FRET_COUNT`, never to a global
 /// constant, so no note can land outside the active tuning's playable range.
-pub fn fret_voicing(tuning: TuningId, bass_string: usize, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
-    let strings = tuning.open_strings();
+pub fn fret_voicing(tuning: &Tuning, bass_string: usize, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
+    let strings = tuning.open_strings;
     let mut out = Vec::with_capacity(intervals.len());
     for (i, &iv) in intervals.iter().enumerate() {
         let string = (bass_string + i).min(strings.len() - 1);
@@ -222,7 +222,7 @@ pub fn fret_voicing(tuning: TuningId, bass_string: usize, root_midi: u8, interva
 /// pitch, find the string with the **smallest non-negative fret ≤ FRET_COUNT**
 /// that produces it, raising the target by octaves until it fits. Returns the
 /// fretted MIDI for each interval in order (monophonic, ascending).
-pub fn fret_notes(tuning: TuningId, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
+pub fn fret_notes(tuning: &Tuning, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(intervals.len());
     for &iv in intervals {
         let mut target = root_midi.saturating_add_signed(iv);
@@ -245,12 +245,12 @@ pub fn fret_notes(tuning: TuningId, root_midi: u8, intervals: &[i8]) -> Vec<u8> 
 /// `≤ target` with `fret ≤ FRET_COUNT`; i.e. the lowest-fret playable voicing.
 /// Returns `None` if no string can voice `target` without exceeding
 /// `FRET_COUNT` (caller then raises an octave).
-fn best_string_midi(tuning: TuningId, target: u8) -> Option<u8> {
+fn best_string_midi(tuning: &Tuning, target: u8) -> Option<u8> {
     if target < MIDI_MIN || target > MIDI_MAX {
         return None;
     }
     let mut best: Option<(u8, usize)> = None; // (fret, string)
-    for (s, &open) in tuning.open_strings().iter().enumerate() {
+    for (s, &open) in tuning.open_strings.iter().enumerate() {
         if target >= open {
             let fret = target - open;
             if fret <= FRET_COUNT {
@@ -278,7 +278,7 @@ pub fn note_names(notes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::note::MIDI_MIN;
-    use crate::tuning::{string_midi, TuningId};
+    use crate::tuning::{string_midi, Tuning, TuningId};
 
     #[test]
     fn chord_intervals_match_spec() {
@@ -336,7 +336,7 @@ mod tests {
     fn fret_voicing_in_range_and_on_valid_frets() {
         for root in [MIDI_MIN, 45, 50, 55, 60] {
             for q in ChordQuality::ALL {
-                let notes = fret_voicing(TuningId::AllFourths, 0, root, q.intervals());
+                let notes = fret_voicing(&Tuning::builtin(TuningId::AllFourths), 0, root, q.intervals());
                 assert!(!notes.is_empty(), "empty voicing for {:?}", q);
                 for &n in &notes {
                     assert!(
@@ -361,7 +361,7 @@ mod tests {
     fn fret_notes_in_range() {
         for root in [MIDI_MIN, 45, 50, 55] {
             for s in ScaleType::ALL {
-                let notes = fret_notes(TuningId::AllFourths, root, s.intervals());
+                let notes = fret_notes(&Tuning::builtin(TuningId::AllFourths), root, s.intervals());
                 assert_eq!(notes.len(), s.intervals().len());
                 for &n in &notes {
                     assert!((MIDI_MIN..=MIDI_MAX).contains(&n));
@@ -382,7 +382,7 @@ mod tests {
         // Root E2=40, Major [0,4,7]: string0 fret0=40, string1 fret? target 44 →
         // open 45 too high, so raise to 44+12=56 → string1 open 45 fret 11=56.
         // Then 47 → open50 too high, +12=59 → string2 fret 9. Ascending voicing.
-        let v = fret_voicing(TuningId::AllFourths, 0, 40, ChordQuality::Major.intervals());
+        let v = fret_voicing(&Tuning::builtin(TuningId::AllFourths), 0, 40, ChordQuality::Major.intervals());
         assert_eq!(v.len(), 3);
         assert!(v.windows(2).all(|w| w[1] >= w[0]));
         for &n in &v {

@@ -85,6 +85,8 @@ pub trait EngineListener: Send + Sync {
 struct EngineInner {
     config: Config,
     library: ContentLibrary,
+    custom_tunings: Vec<crate::custom_tuning::CustomTuning>,
+    active_tuning: crate::tuning::Tuning,
     rng: ChaCha8Rng,
     /// Current prompt (set on start + every advance).
     current: Challenge,
@@ -158,6 +160,17 @@ impl Engine {
             }
             _ => ContentLibrary::bundled(),
         };
+        let custom_tunings = match &config.custom_tuning_path {
+            Some(p) if !p.as_os_str().is_empty() => match crate::custom_tuning::load_custom_tunings(p) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("custom tuning load failed ({e:?}); using none");
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        };
+        let active_tuning = crate::custom_tuning::resolve_tuning(&config.tuning, &custom_tunings);
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
             None => ChaCha8Rng::from_entropy(),
@@ -169,6 +182,8 @@ impl Engine {
         let mut inner = EngineInner {
             config: config.clone(),
             library,
+            custom_tunings,
+            active_tuning: active_tuning.clone(),
             rng,
             current: Challenge {
                 kind: ChallengeType::Note,
@@ -190,7 +205,7 @@ impl Engine {
             cooldown_remaining: Duration::ZERO,
         };
         // Pick an initial prompt so the engine always has a `current`.
-        pick_new_prompt(&mut inner, &cats, config.tuning);
+        pick_new_prompt(&mut inner, &cats, &active_tuning);
         // Do not start the timer until `start()`.
         Ok(Engine {
             inner: Arc::new(Mutex::new(inner)),
@@ -223,8 +238,8 @@ impl Engine {
         {
             let mut inner = self.inner.lock();
             let cats = inner.config.active_categories();
-            let tuning = inner.config.tuning;
-            pick_new_prompt(&mut inner, &cats, tuning);
+            let tuning = inner.active_tuning.clone();
+            pick_new_prompt(&mut inner, &cats, &tuning);
             reset_timer(&mut inner);
             emit_prompt(&self.listener, &inner);
             emit_score(&self.listener, &inner);
@@ -258,10 +273,11 @@ impl Engine {
     /// Update config at runtime; reloads content library if the path changed.
     pub fn set_config(&self, cfg: Config) {
         let mut inner = self.inner.lock();
-        let path_changed = inner.config.custom_content_path != cfg.custom_content_path;
+        let content_path_changed = inner.config.custom_content_path != cfg.custom_content_path;
+        let tuning_path_changed = inner.config.custom_tuning_path != cfg.custom_tuning_path;
         inner.config = cfg.clone();
         inner.default_duration = Duration::from_secs(cfg.default_duration_sec.max(1) as u64);
-        if path_changed {
+        if content_path_changed {
             match &cfg.custom_content_path {
                 Some(p) if !p.as_os_str().is_empty() => {
                     match ContentLibrary::load(p) {
@@ -272,6 +288,25 @@ impl Engine {
                 _ => inner.library = ContentLibrary::bundled(),
             }
         }
+        if tuning_path_changed {
+            inner.custom_tunings = match &cfg.custom_tuning_path {
+                Some(p) if !p.as_os_str().is_empty() => match crate::custom_tuning::load_custom_tunings(p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("custom tuning reload failed: {e:?}");
+                        Vec::new()
+                    }
+                },
+                _ => Vec::new(),
+            };
+        }
+        inner.active_tuning = crate::custom_tuning::resolve_tuning(&cfg.tuning, &inner.custom_tunings);
+    }
+
+    /// Snapshot of the loaded custom tunings (for UI display, e.g. the
+    /// tuning picker).
+    pub fn custom_tunings(&self) -> Vec<crate::custom_tuning::CustomTuning> {
+        self.inner.lock().custom_tunings.clone()
     }
 
     /// Skip the current prompt (counts as a timeout): emit Timeout + advance.
@@ -283,8 +318,8 @@ impl Engine {
         let mut inner = self.inner.lock();
         emit(&self.listener, EngineEvent::Timeout);
         inner.score_total += 1;
-        let tuning = inner.config.tuning;
-        pick_new_prompt(&mut inner, &cats, tuning);
+        let tuning = inner.active_tuning.clone();
+        pick_new_prompt(&mut inner, &cats, &tuning);
         reset_timer(&mut inner);
         emit_prompt(&self.listener, &inner);
         emit_score(&self.listener, &inner);
@@ -379,7 +414,7 @@ fn run_driver(
 // Core logic (pure, testable)
 // ---------------------------------------------------------------------------
 
-fn pick_new_prompt(inner: &mut EngineInner, cats: &[ChallengeType], tuning: crate::tuning::TuningId) {
+fn pick_new_prompt(inner: &mut EngineInner, cats: &[ChallengeType], tuning: &crate::tuning::Tuning) {
     if cats.is_empty() {
         return;
     }
@@ -533,8 +568,8 @@ fn accept_match(
             inner.cooldown_remaining = Duration::from_millis(pause_ms as u64);
             emit(listener, EngineEvent::Cooldown { duration_ms: pause_ms as u64 });
         } else {
-            let tuning = inner.config.tuning;
-            pick_new_prompt(inner, cats, tuning);
+            let tuning = inner.active_tuning.clone();
+            pick_new_prompt(inner, cats, &tuning);
             reset_timer(inner);
             emit_prompt(listener, inner);
             emit_score(listener, inner);
@@ -551,8 +586,8 @@ fn handle_tick(
     if inner.cooldown_remaining > Duration::ZERO {
         inner.cooldown_remaining = inner.cooldown_remaining.saturating_sub(dt);
         if inner.cooldown_remaining == Duration::ZERO {
-            let tuning = inner.config.tuning;
-            pick_new_prompt(inner, cats, tuning);
+            let tuning = inner.active_tuning.clone();
+            pick_new_prompt(inner, cats, &tuning);
             reset_timer(inner);
             emit_prompt(listener, inner);
             emit_score(listener, inner);
@@ -567,8 +602,8 @@ fn handle_tick(
         emit(listener, EngineEvent::Timeout);
         inner.score_total += 1;
         emit_score(listener, inner);
-        let tuning = inner.config.tuning;
-        pick_new_prompt(inner, cats, tuning);
+        let tuning = inner.active_tuning.clone();
+        pick_new_prompt(inner, cats, &tuning);
         reset_timer(inner);
         emit_prompt(listener, inner);
         emit_score(listener, inner);
@@ -659,8 +694,8 @@ mod tests {
         // prompt chain by setting an initial prompt (mirrors start() minus audio).
         let cats = eng.inner.lock().config.active_categories();
         let mut inner = eng.inner.lock();
-        let tuning = inner.config.tuning;
-        pick_new_prompt(&mut inner, &cats, tuning);
+        let tuning = inner.active_tuning.clone();
+        pick_new_prompt(&mut inner, &cats, &tuning);
         reset_timer(&mut inner);
         emit_prompt(&eng.listener, &inner);
         emit_score(&eng.listener, &inner);
@@ -785,8 +820,8 @@ mod tests {
             // Re-roll by emitting a new prompt; deterministic seed: re-pick.
             let cats = eng.inner.lock().config.active_categories();
             let mut g = eng.inner.lock();
-            let tuning = g.config.tuning;
-            pick_new_prompt(&mut g, &cats, tuning);
+            let tuning = g.active_tuning.clone();
+            pick_new_prompt(&mut g, &cats, &tuning);
         }
         let targets = eng.inner.lock().current.targets.clone();
         assert!(targets.len() >= 2, "need ≥2 scale targets for ordering test");

@@ -29,6 +29,7 @@ pub struct FfiConfig {
     pub enabled: Vec<String>,
     pub random_mode: bool,
     pub custom_content_path: Option<String>,
+    pub custom_tuning_path: Option<String>,
     pub audio_device_name: Option<String>,
     pub tuning: String,
     pub match_pause_ms: u32,
@@ -78,8 +79,12 @@ impl From<&Config> for FfiConfig {
             enabled,
             random_mode: c.random_mode,
             custom_content_path: c.custom_content_path.as_ref().map(|p| p.display().to_string()),
+            custom_tuning_path: c.custom_tuning_path.as_ref().map(|p| p.display().to_string()),
             audio_device_name: c.audio_device_name.clone(),
-            tuning: c.tuning.label().to_string(),
+            tuning: match &c.tuning {
+                crate::custom_tuning::ActiveTuning::Builtin(id) => id.label().to_string(),
+                crate::custom_tuning::ActiveTuning::Custom { name } => name.clone(),
+            },
             match_pause_ms: c.match_pause_ms,
         }
     }
@@ -108,13 +113,20 @@ impl FfiConfig {
                 .custom_content_path
                 .as_ref()
                 .map(std::path::PathBuf::from),
+            custom_tuning_path: self
+                .custom_tuning_path
+                .as_ref()
+                .map(std::path::PathBuf::from),
             audio_device_name: self.audio_device_name.clone(),
             tuning: crate::tuning::TuningId::ALL
                 .iter()
                 .find(|t| t.label() == self.tuning)
-                .copied()
-                .unwrap_or_default(),
+                .map(|&id| crate::custom_tuning::ActiveTuning::Builtin(id))
+                .unwrap_or_else(|| crate::custom_tuning::ActiveTuning::Custom { name: self.tuning.clone() }),
             match_pause_ms: self.match_pause_ms,
+            // Not currently exposed over the FFI surface (TUI-only setting;
+            // Android has no fretboard visualizer to highlight).
+            fretboard_highlight: false,
         }
     }
 }

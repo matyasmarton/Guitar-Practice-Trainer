@@ -10,6 +10,7 @@ pub mod audio;
 pub mod challenges;
 pub mod config;
 pub mod content;
+pub mod custom_tuning;
 pub mod engine;
 pub mod licks;
 pub mod music;

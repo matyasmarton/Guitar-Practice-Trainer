@@ -34,7 +34,8 @@ use guitar_trainer_core::config::{Config, EnabledCategory};
 use guitar_trainer_core::engine::{Engine, EngineEvent, EngineListener};
 use guitar_trainer_core::note::Note;
 use guitar_trainer_core::theme::Theme;
-use guitar_trainer_core::tuning::{string_note, TuningId, FRET_COUNT};
+use guitar_trainer_core::tuning::{Tuning, TuningId, FRET_COUNT};
+use guitar_trainer_core::custom_tuning::{ActiveTuning, CustomTuning};
 
 /// One completed prompt, kept for the Practice screen's "recent attempts"
 /// list (see `UiState::history`). Built purely from events the engine
@@ -108,6 +109,8 @@ enum Screen {
     Practice,
     Settings,
     DevicePick,
+    TuningPick,
+    CustomTuningHelp,
 }
 
 /// What's currently being typed, if anything.
@@ -116,12 +119,13 @@ enum Edit {
     None,
     Timer,
     Path,
+    TuningPath,
 }
 
 const MENU_ITEMS: [&str; 3] = ["Start Practice", "Settings", "Quit"];
 const PRACTICE_ACTIONS: [&str; 3] = ["Stop", "Skip", "Settings"];
-/// Settings rows: 0=Timer 1=Tuning 2=Fretboard highlight 3=Random 4..=10=categories(7) 11=Audio Device 12=Custom Path 13=Back.
-const SETTINGS_ROW_COUNT: usize = 14;
+/// Settings rows: 0=Timer 1=Select tuning 2=Add custom tuning 3=Fretboard highlight 4=Random 5..=11=categories(7) 12=Audio Device 13=Custom Content Path 14=Back.
+const SETTINGS_ROW_COUNT: usize = 15;
 
 struct App {
     screen: Screen,
@@ -129,6 +133,7 @@ struct App {
     practice_idx: usize,
     settings_idx: usize,
     device_idx: usize,
+    tuning_pick_idx: usize,
     edit: Edit,
     edit_buf: String,
     devices: Vec<String>,
@@ -143,6 +148,7 @@ impl App {
             practice_idx: 0,
             settings_idx: 0,
             device_idx: 0,
+            tuning_pick_idx: 0,
             edit: Edit::None,
             edit_buf: String::new(),
             devices: Vec::new(),
@@ -229,6 +235,8 @@ fn main() -> Result<()> {
                 Screen::Practice => draw_practice(f, area, &app, &ui, &settings, &theme),
                 Screen::Settings => draw_settings(f, area, &app, &settings, &theme),
                 Screen::DevicePick => draw_device_pick(f, area, &app, &settings, &theme),
+                Screen::TuningPick => draw_tuning_pick(f, area, &app, &settings, &theme),
+                Screen::CustomTuningHelp => draw_custom_tuning_help(f, area, &app, &settings, &theme),
             }
         })?;
     }
@@ -311,7 +319,10 @@ fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
 #[derive(Default, Clone)]
 struct SettingsState {
     duration_sec: u32,
-    tuning: TuningId,
+    tuning: ActiveTuning,
+    custom_tunings: Vec<CustomTuning>,
+    custom_tuning_path: String,
+    custom_tuning_status: Option<String>,
     enabled: Vec<(ChallengeType, bool)>,
     random_mode: bool,
     fretboard_highlight: bool,
@@ -334,7 +345,14 @@ impl SettingsState {
             .collect();
         SettingsState {
             duration_sec: cfg.default_duration_sec,
-            tuning: cfg.tuning,
+            tuning: cfg.tuning.clone(),
+            custom_tunings: engine.custom_tunings(),
+            custom_tuning_path: cfg
+                .custom_tuning_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            custom_tuning_status: None,
             enabled,
             random_mode: cfg.random_mode,
             fretboard_highlight: cfg.fretboard_highlight,
@@ -360,7 +378,7 @@ impl SettingsState {
         }
         Config {
             default_duration_sec: self.duration_sec.max(1),
-            tuning: self.tuning,
+            tuning: self.tuning.clone(),
             enabled: set,
             random_mode: self.random_mode,
             fretboard_highlight: self.fretboard_highlight,
@@ -369,9 +387,18 @@ impl SettingsState {
             } else {
                 Some(std::path::PathBuf::from(&self.custom_path))
             },
+            custom_tuning_path: if self.custom_tuning_path.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&self.custom_tuning_path))
+            },
             audio_device_name: self.audio_device.clone(),
             match_pause_ms: self.match_pause_ms,
         }
+    }
+
+    fn resolved_tuning(&self) -> Tuning {
+        guitar_trainer_core::custom_tuning::resolve_tuning(&self.tuning, &self.custom_tunings)
     }
 }
 
@@ -426,7 +453,7 @@ fn handle_key(
             KeyCode::Char(c) => {
                 let ok = match app.edit {
                     Edit::Timer => c.is_ascii_digit() && app.edit_buf.len() < 4,
-                    Edit::Path => (c.is_ascii_graphic() || c == ' ') && app.edit_buf.len() < 200,
+                    Edit::Path | Edit::TuningPath => (c.is_ascii_graphic() || c == ' ') && app.edit_buf.len() < 200,
                     Edit::None => false,
                 };
                 if ok {
@@ -443,6 +470,8 @@ fn handle_key(
         Screen::Practice => handle_practice_key(k, app, engine, ui, settings),
         Screen::Settings => handle_settings_key(k, app, settings, engine, ui),
         Screen::DevicePick => handle_device_pick_key(k, app, settings, engine, ui),
+        Screen::TuningPick => handle_tuning_pick_key(k, app, settings),
+        Screen::CustomTuningHelp => handle_custom_tuning_help_key(k, app, settings),
     }
 }
 
@@ -455,6 +484,27 @@ fn commit_edit(app: &mut App, settings: &mut SettingsState, engine: &Engine) {
         }
         Edit::Path => {
             settings.custom_path = app.edit_buf.clone();
+        }
+        Edit::TuningPath => {
+            settings.custom_tuning_path = app.edit_buf.clone();
+            settings.custom_tuning_status = if settings.custom_tuning_path.is_empty() {
+                settings.custom_tunings = Vec::new();
+                None
+            } else {
+                match guitar_trainer_core::custom_tuning::load_custom_tunings(std::path::Path::new(
+                    &settings.custom_tuning_path,
+                )) {
+                    Ok(v) => {
+                        let n = v.len();
+                        settings.custom_tunings = v;
+                        Some(format!("Loaded {n} custom tuning(s)."))
+                    }
+                    Err(e) => {
+                        settings.custom_tunings = Vec::new();
+                        Some(format!("Load failed: {e}"))
+                    }
+                }
+            };
         }
         Edit::None => {}
     }
@@ -553,18 +603,22 @@ fn handle_settings_key(
                 app.edit_buf = settings.duration_sec.to_string();
             }
             1 => {
-                let idx = TuningId::ALL.iter().position(|&t| t == settings.tuning).unwrap_or(0);
-                settings.tuning = TuningId::ALL[(idx + 1) % TuningId::ALL.len()];
+                let candidates = tuning_pick_candidates(settings);
+                app.tuning_pick_idx = candidates.iter().position(|c| *c == settings.tuning).unwrap_or(0);
+                app.screen = Screen::TuningPick;
             }
-            2 => settings.fretboard_highlight = !settings.fretboard_highlight,
-            3 => settings.random_mode = !settings.random_mode,
-            4..=10 => {
-                let i = app.settings_idx - 4;
+            2 => {
+                app.screen = Screen::CustomTuningHelp;
+            }
+            3 => settings.fretboard_highlight = !settings.fretboard_highlight,
+            4 => settings.random_mode = !settings.random_mode,
+            5..=11 => {
+                let i = app.settings_idx - 5;
                 if let Some(slot) = settings.enabled.get_mut(i) {
                     slot.1 = !slot.1;
                 }
             }
-            11 => {
+            12 => {
                 start_device_scan(app);
                 app.device_idx = settings
                     .audio_device
@@ -573,11 +627,11 @@ fn handle_settings_key(
                     .unwrap_or(0);
                 app.screen = Screen::DevicePick;
             }
-            12 => {
+            13 => {
                 app.edit = Edit::Path;
                 app.edit_buf = settings.custom_path.clone();
             }
-            13 => {
+            14 => {
                 apply_settings(settings, engine);
                 app.screen = if ui.running { Screen::Practice } else { Screen::Menu };
             }
@@ -808,7 +862,7 @@ fn session_summary_lines(ui: &UiState, settings: &SettingsState, theme: &Theme) 
         Line::from(vec![Span::styled("Device     ", label_style), Span::raw(device_name)]),
         Line::from(vec![
             Span::styled("Tuning     ", label_style),
-            Span::raw(settings.tuning.label().to_string()),
+            Span::raw(settings.resolved_tuning().label),
         ]),
         Line::from(vec![
             Span::styled("Categories ", label_style),
@@ -908,7 +962,7 @@ fn draw_menu(
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            settings.tuning.label().to_string(),
+            settings.resolved_tuning().label,
             Style::default().fg(Color::DarkGray),
         )),
     ])
@@ -1562,12 +1616,12 @@ fn strip_octave(name: &str) -> &str {
 /// whenever there's vertical room to spare) explains the fret-marker dots
 /// and, in highlight mode, what the accent color means.
 fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settings: &SettingsState, theme: &Theme) {
-    let tuning = settings.tuning;
+    let tuning = settings.resolved_tuning();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
-        .title(format!(" Fretboard — {} ", tuning.label()));
+        .title(format!(" Fretboard — {} ", tuning.label));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -1670,7 +1724,7 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
     let centered_cell = |text: String, style: Style| Cell::from(Line::from(text).alignment(Alignment::Center)).style(style);
 
     let header = Row::new(std::iter::once(centered_cell("Fr".to_string(), header_style)).chain(
-        tuning.open_strings().iter().map(|&m| {
+        tuning.open_strings.iter().map(|&m| {
             let name = Note::from_midi_clamped(m).name();
             centered_cell(label(strip_octave(&name)), header_style)
         }),
@@ -1687,7 +1741,7 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
             let row_style = if fret == 0 { open_style } else { note_style };
             let gutter = centered_cell(format!("{fret}{marker}"), gutter_style);
             let string_cells = (0..6usize).map(|s| {
-                let name = string_note(tuning, s, fret).map(|n| n.name()).unwrap_or_else(|| "-".to_string());
+                let name = tuning.string_note(s, fret).map(|n| n.name()).unwrap_or_else(|| "-".to_string());
                 let cell_style = if active.contains(&name.as_str()) { highlight_style } else { row_style };
                 centered_cell(label(&name), cell_style)
             });
@@ -1935,28 +1989,29 @@ fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, setti
               find every target note."
             .to_string(),
         1 => format!(
-            "Open strings, low → high: {}",
-            tuning_strings_label(settings.tuning)
+            "Open a picker of the 3 built-in tunings plus any loaded custom tunings. Open strings, low → high: {}",
+            tuning_strings_label(settings.resolved_tuning().open_strings)
         ),
-        2 => "When ON, the Fretboard panel (visible in the full-screen Practice layout) \
+        2 => "Point this at a TOML file defining one or more custom tunings. Press Enter to open the format guide and set the path.".to_string(),
+        3 => "When ON, the Fretboard panel (visible in the full-screen Practice layout) \
               highlights the current prompt's still-needed target note(s) live instead of \
               showing every note as a static reference."
             .to_string(),
-        3 => "When ON, each new prompt draws uniformly at random from the enabled categories \
+        4 => "When ON, each new prompt draws uniformly at random from the enabled categories \
               below, instead of cycling through them in order."
             .to_string(),
-        4..=10 => {
-            let (c, _) = &settings.enabled[app.settings_idx - 4];
+        5..=11 => {
+            let (c, _) = &settings.enabled[app.settings_idx - 5];
             category_help(*c).to_string()
         }
-        11 => format!(
+        12 => format!(
             "{} input device(s) found. Press Enter to rescan and choose one.",
             app.devices.len()
         ),
-        12 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
+        13 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
               library. Leave empty to use only the built-in content."
             .to_string(),
-        13 => "Save every change above and return to where you started.".to_string(),
+        14 => "Save every change above and return to where you started.".to_string(),
         _ => String::new(),
     };
     let block = Block::default()
@@ -1970,9 +2025,8 @@ fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, setti
     f.render_widget(p, area);
 }
 
-fn tuning_strings_label(tuning: TuningId) -> String {
-    tuning
-        .open_strings()
+fn tuning_strings_label(open_strings: [u8; 6]) -> String {
+    open_strings
         .iter()
         .map(|&m| Note::from_midi_clamped(m).name())
         .collect::<Vec<_>>()
@@ -2000,21 +2054,28 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
                 format!("Timer (seconds): {}", settings.duration_sec)
             }
         }
-        1 => format!("Tuning: {}", settings.tuning.label()),
-        2 => format!(
+        1 => format!("Select tuning: {}", settings.resolved_tuning().label),
+        2 => {
+            if settings.custom_tunings.is_empty() {
+                "Add custom tuning".to_string()
+            } else {
+                format!("Add custom tuning ({} loaded)", settings.custom_tunings.len())
+            }
+        }
+        3 => format!(
             "Fretboard highlight: {}",
             if settings.fretboard_highlight { "ON" } else { "off" }
         ),
-        3 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
-        4..=10 => {
-            let (c, on) = &settings.enabled[i - 4];
+        4 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
+        5..=11 => {
+            let (c, on) = &settings.enabled[i - 5];
             format!("[{}] {}", if *on { "✓" } else { " " }, c.label())
         }
-        11 => format!(
+        12 => format!(
             "Audio device: {}",
             settings.audio_device.clone().unwrap_or_else(|| "(default mic)".to_string())
         ),
-        12 => {
+        13 => {
             if app.edit == Edit::Path {
                 format!("Custom content path: {}█", app.edit_buf)
             } else {
@@ -2026,7 +2087,7 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
                 format!("Custom content path: {p}")
             }
         }
-        13 => "← Back (save & return)".to_string(),
+        14 => "← Back (save & return)".to_string(),
         _ => String::new(),
     }
 }
@@ -2071,4 +2132,121 @@ fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings:
     let mut state = ListState::default();
     state.select(Some(app.device_idx));
     f.render_stateful_widget(list, rows[0], &mut state);
+}
+
+fn tuning_pick_candidates(settings: &SettingsState) -> Vec<ActiveTuning> {
+    TuningId::ALL
+        .iter()
+        .map(|&id| ActiveTuning::Builtin(id))
+        .chain(settings.custom_tunings.iter().map(|t| ActiveTuning::Custom { name: t.name.clone() }))
+        .collect()
+}
+
+fn tuning_pick_label(c: &ActiveTuning, settings: &SettingsState) -> String {
+    match c {
+        ActiveTuning::Builtin(id) => id.label().to_string(),
+        ActiveTuning::Custom { name } => {
+            let t = guitar_trainer_core::custom_tuning::resolve_tuning(c, &settings.custom_tunings);
+            format!("{} ({})", name, tuning_strings_label(t.open_strings))
+        }
+    }
+}
+
+fn draw_tuning_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Select Tuning — ↑↓ select, Enter to choose, Esc to cancel ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let candidates = tuning_pick_candidates(settings);
+    let items: Vec<ListItem> = candidates
+        .iter()
+        .map(|c| {
+            let label = tuning_pick_label(c, settings);
+            if *c == settings.tuning {
+                ListItem::new(format!("{label}  ✓ current"))
+            } else {
+                ListItem::new(label)
+            }
+        })
+        .collect();
+
+    let list_h = (items.len() as u16).min(inner.height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_h), Constraint::Fill(1)])
+        .split(inner);
+
+    let list = List::new(items).highlight_style(selection_style(theme)).highlight_symbol("‣ ");
+    let mut state = ListState::default();
+    state.select(Some(app.tuning_pick_idx));
+    f.render_stateful_widget(list, rows[0], &mut state);
+}
+
+fn handle_tuning_pick_key(k: KeyEvent, app: &mut App, settings: &mut SettingsState) -> bool {
+    let candidates = tuning_pick_candidates(settings);
+    let count = candidates.len().max(1);
+    match k.code {
+        KeyCode::Up => app.tuning_pick_idx = (app.tuning_pick_idx + count - 1) % count,
+        KeyCode::Down => app.tuning_pick_idx = (app.tuning_pick_idx + 1) % count,
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if let Some(c) = candidates.get(app.tuning_pick_idx) {
+                settings.tuning = c.clone();
+            }
+            app.screen = Screen::Settings;
+        }
+        KeyCode::Esc => app.screen = Screen::Settings,
+        _ => {}
+    }
+    true
+}
+
+fn draw_custom_tuning_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Add Custom Tuning — Enter to edit path, Esc back ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let path_line = if app.edit == Edit::TuningPath {
+        format!("Path: {}█", app.edit_buf)
+    } else if settings.custom_tuning_path.is_empty() {
+        "Path: (none)".to_string()
+    } else {
+        format!("Path: {}", settings.custom_tuning_path)
+    };
+    let status_line = settings.custom_tuning_status.clone().unwrap_or_default();
+
+    let body = format!(
+        "Point this at a TOML file defining one or more custom tunings; each is merged into the tuning picker by name alongside the 3 built-ins.\n\n\
+         Format (six strings, low → high, scientific pitch notation \"<letter>[#|b]<octave>\"):\n\n\
+         [[tunings]]\n\
+         name = \"Open D\"\n\
+         strings = [\"D2\", \"A2\", \"D3\", \"F#3\", \"A3\", \"D4\"]\n\n\
+         [[tunings]]\n\
+         name = \"DADGAD\"\n\
+         strings = [\"D2\", \"A2\", \"D3\", \"G3\", \"A3\", \"D4\"]\n\n\
+         Rules: names unique and non-empty; strings strictly ascending low→high; adjacent strings ≤22 frets apart; every note (open string through fret 22) must fall within D2..F6, this app's supported range.\n\n\
+         {path_line}\n\
+         {status_line}"
+    );
+    let p = Paragraph::new(body)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)));
+    f.render_widget(p, inner);
+}
+
+fn handle_custom_tuning_help_key(k: KeyEvent, app: &mut App, settings: &mut SettingsState) -> bool {
+    match k.code {
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            app.edit = Edit::TuningPath;
+            app.edit_buf = settings.custom_tuning_path.clone();
+        }
+        KeyCode::Esc => app.screen = Screen::Settings,
+        _ => {}
+    }
+    true
 }

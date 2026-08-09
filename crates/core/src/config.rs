@@ -57,9 +57,10 @@ pub struct Config {
     pub default_duration_sec: u32,
     /// Which challenge categories are active.
     pub enabled: EnumSet<EnabledCategory>,
-    /// Active guitar tuning.
+    /// Active guitar tuning: one of the 3 built-ins, or a name resolved
+    /// against `custom_tuning_path`.
     #[serde(default)]
-    pub tuning: crate::tuning::TuningId,
+    pub tuning: crate::custom_tuning::ActiveTuning,
     /// Random mode: randomize the time window *and* content per prompt.
     pub random_mode: bool,
     /// If true, the Practice screen's Fretboard panel highlights the
@@ -70,6 +71,9 @@ pub struct Config {
     /// Optional path to a custom-content TOML file.
     #[serde(default)]
     pub custom_content_path: Option<PathBuf>,
+    /// Optional path to a custom-tuning TOML file (see `crate::custom_tuning`).
+    #[serde(default)]
+    pub custom_tuning_path: Option<PathBuf>,
     /// Optional preferred input audio device name (Mac picker).
     #[serde(default)]
     pub audio_device_name: Option<String>,
@@ -89,10 +93,11 @@ impl Default for Config {
         Config {
             default_duration_sec: 30,
             enabled: EnumSet::all(),
-            tuning: crate::tuning::TuningId::default(),
+            tuning: crate::custom_tuning::ActiveTuning::default(),
             random_mode: false,
             fretboard_highlight: false,
             custom_content_path: None,
+            custom_tuning_path: None,
             audio_device_name: None,
             match_pause_ms: default_match_pause_ms(),
         }
@@ -213,7 +218,10 @@ mod tests {
 
     #[test]
     fn defaults_to_all_fourths_tuning() {
-        assert_eq!(Config::default().tuning, crate::tuning::TuningId::AllFourths);
+        assert_eq!(
+            Config::default().tuning,
+            crate::custom_tuning::ActiveTuning::Builtin(crate::tuning::TuningId::AllFourths)
+        );
     }
 
     #[test]
@@ -224,10 +232,13 @@ mod tests {
     #[test]
     fn tuning_round_trip_toml() {
         let mut c = Config::default();
-        c.tuning = crate::tuning::TuningId::Standard;
+        c.tuning = crate::custom_tuning::ActiveTuning::Builtin(crate::tuning::TuningId::Standard);
         let text = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.tuning, crate::tuning::TuningId::Standard);
+        assert_eq!(
+            back.tuning,
+            crate::custom_tuning::ActiveTuning::Builtin(crate::tuning::TuningId::Standard)
+        );
     }
 
     #[test]
@@ -244,8 +255,34 @@ mod tests {
         // Simulates an already-deployed config.toml predating `tuning`/`match_pause_ms`.
         let text = "default_duration_sec = 30\nenabled = []\nrandom_mode = false\n";
         let c: Config = toml::from_str(text).unwrap();
-        assert_eq!(c.tuning, crate::tuning::TuningId::AllFourths);
+        assert_eq!(
+            c.tuning,
+            crate::custom_tuning::ActiveTuning::Builtin(crate::tuning::TuningId::AllFourths)
+        );
         assert_eq!(c.match_pause_ms, 3000);
         assert!(!c.fretboard_highlight);
+    }
+
+    #[test]
+    fn old_bare_string_tuning_still_parses() {
+        // A config.toml saved before this change: `tuning = "standard"`.
+        let text = "default_duration_sec = 30\nenabled = []\nrandom_mode = false\ntuning = \"standard\"\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            c.tuning,
+            crate::custom_tuning::ActiveTuning::Builtin(crate::tuning::TuningId::Standard)
+        );
+    }
+
+    #[test]
+    fn custom_tuning_selection_round_trips_toml() {
+        let mut c = Config::default();
+        c.tuning = crate::custom_tuning::ActiveTuning::Custom { name: "Open D".to_string() };
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            back.tuning,
+            crate::custom_tuning::ActiveTuning::Custom { name: "Open D".to_string() }
+        );
     }
 }
