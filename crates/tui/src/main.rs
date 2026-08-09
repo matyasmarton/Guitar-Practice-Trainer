@@ -1005,22 +1005,31 @@ fn render_thick_rounded_border(f: &mut ratatui::Frame<'_>, area: Rect, style: St
 /// information during practice, and the hero panel's largest, boldest
 /// element. Each target is its own hand-drawn chip: a heavier-weight
 /// rounded border (`render_thick_rounded_border`, per the "thicker chip
-/// border" request) framing the note value rendered as glyph text. Tries
-/// `PixelSize::HalfHeight` first (the approved "36pt" chip size); if the
-/// full chip row wouldn't fit at that width (many simultaneous targets —
-/// a 6-7 note scale/mode), steps down to the narrower `PixelSize::Quadrant`
-/// tier instead of dropping straight to small crisp text. This is what
-/// fixes the reported bug where a 1-2 target prompt rendered big glyphs
-/// but a many-target prompt silently fell back to tiny plain text right
-/// next to it — every target count now gets *some* glyph tier at the same
-/// two sizes, so chip weight reads consistently across prompts; only a
-/// genuinely extreme case (very narrow terminal, many long labels) still
-/// falls back to plain text so nothing is ever clipped. A checkmark glyph
-/// isn't in the underlying 8x8 font, so match state is carried by color
-/// alone (border + text turn green), the same convention already used by
-/// `render_detected_indicator`. Ordered prompts chain the chips with an
-/// arrow so the required sequence reads left to right; unordered prompts
-/// space them evenly.
+/// border" request) framing the note value. Tries four tiers in order —
+/// `PixelSize::HalfHeight` glyph (the approved "36pt" size), narrower
+/// `PixelSize::Quadrant` glyph, letter-spaced crisp text, then unspaced
+/// compact crisp text — and, critically, fit-checks *every* tier against
+/// the actual available width before committing to it. The previous
+/// version picked crisp text unconditionally as a last resort with no
+/// fit check at all: an 11-target Lick (e.g. "Major pentatonic run")
+/// needed ~171 columns but the panel only has ~155-161, so ratatui's
+/// constraint solver silently compressed some `Constraint::Length` chip
+/// cells more than others — chips in the *same row* rendered at visibly
+/// different widths, clipping labels like "F#2" down to "F #". That was
+/// the actual "font inconsistent between modes" bug: Note/Chord (few
+/// targets) always fit the glyph tiers and looked fine, while Lick/Piece
+/// (many targets) silently hit this unfit crisp tier and looked broken.
+/// Every tier below is now fit-checked before use, and if truly nothing
+/// fits, the last resort uniformly shrinks every chip to the same width
+/// instead of letting the layout engine compress cells unevenly — chip
+/// size within a row is always uniform, and the tier ladder itself is
+/// identical across every challenge mode from Note to Piece. A checkmark
+/// glyph isn't in the underlying 8x8 font, so the two glyph tiers carry
+/// match state via color alone (border + text turn green), the same
+/// convention already used by `render_detected_indicator`; the two crisp
+/// tiers keep a leading checkmark. Ordered prompts chain the chips with
+/// an arrow so the required sequence reads left to right; unordered
+/// prompts space them evenly.
 fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
         return;
@@ -1033,40 +1042,57 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let n = ui.targets.len() as u16;
 
     let spaced = |t: &str| -> String { t.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
-    // Crisp fallback labels keep the checkmark prefix; glyph labels drop
-    // it (unsupported by the 8x8 font) and rely on color for match state.
-    let plain_labels: Vec<String> = ui
-        .targets
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
-            if matched { format!("\u{2713} {}", spaced(t)) } else { spaced(t) }
-        })
-        .collect();
+    let crisp_labels = |space: bool| -> Vec<String> {
+        ui.targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
+                let body = if space { spaced(t) } else { t.clone() };
+                if matched { format!("\u{2713} {body}") } else { body }
+            })
+            .collect()
+    };
     // Glyph cells already have their own built-in per-character padding
-    // (the 8x8 font's own spacing), so — unlike the crisp fallback, which
-    // needs manual letter-spacing to avoid reading cramped — glyph labels
+    // (the 8x8 font's own spacing), so — unlike the crisp tiers, which
+    // need manual letter-spacing to avoid reading cramped — glyph labels
     // skip it: keeps chips narrower, so more simultaneous targets qualify
     // for glyph rendering instead of falling back.
     let glyph_labels: Vec<String> = ui.targets.iter().map(|t| t.clone()).collect();
-    let max_glyph_chars = glyph_labels.iter().map(|l| l.chars().count() as u16).max().unwrap_or(1);
+    let spaced_labels = crisp_labels(true);
+    let compact_labels = crisp_labels(false);
 
-    let plain_box_w = plain_labels.iter().map(|l| l.chars().count() as u16 + 6).max().unwrap_or(1);
-    let full_box_w = max_glyph_chars * HERO_GLYPH_COLS_PER_CHAR + 6;
-    let narrow_box_w = max_glyph_chars * HERO_GLYPH_COLS_PER_CHAR_NARROW + 6;
+    let max_chars = |labels: &[String]| labels.iter().map(|l| l.chars().count() as u16).max().unwrap_or(1);
+    let fits = |box_w: u16| box_w.saturating_mul(n) + gap_w.saturating_mul(n.saturating_sub(1)) <= area.width;
     let fits_height = area.height >= HERO_GLYPH_ROWS + 2;
-    let full_fits = fits_height && full_box_w * n + gap_w * n.saturating_sub(1) <= area.width;
-    let narrow_fits = fits_height && narrow_box_w * n + gap_w * n.saturating_sub(1) <= area.width;
 
-    let (box_w, glyph_pixel_size) = if full_fits {
-        (full_box_w, Some(PixelSize::HalfHeight))
-    } else if narrow_fits {
-        (narrow_box_w, Some(PixelSize::Quadrant))
-    } else {
-        (plain_box_w, None)
-    };
-    let content_w = (box_w * n + gap_w * n.saturating_sub(1)).min(area.width);
+    let glyph_chars = max_chars(&glyph_labels);
+    let full_box_w = glyph_chars * HERO_GLYPH_COLS_PER_CHAR + 6;
+    let narrow_box_w = glyph_chars * HERO_GLYPH_COLS_PER_CHAR_NARROW + 6;
+    let spaced_box_w = max_chars(&spaced_labels) + 6;
+    let compact_box_w = max_chars(&compact_labels) + 6;
+
+    let (box_w, glyph_pixel_size, labels): (u16, Option<PixelSize>, &Vec<String>) =
+        if fits_height && fits(full_box_w) {
+            (full_box_w, Some(PixelSize::HalfHeight), &glyph_labels)
+        } else if fits_height && fits(narrow_box_w) {
+            (narrow_box_w, Some(PixelSize::Quadrant), &glyph_labels)
+        } else if fits(spaced_box_w) {
+            (spaced_box_w, None, &spaced_labels)
+        } else if fits(compact_box_w) {
+            (compact_box_w, None, &compact_labels)
+        } else {
+            // Nothing fits at its natural width (extreme case: very
+            // narrow terminal with many long labels). Shrink every chip
+            // to the same uniform width the area can actually provide,
+            // rather than handing the layout engine oversized `Length`
+            // constraints it can only satisfy by compressing some cells
+            // more than others — that silent compression was the root
+            // cause of the reported bug.
+            let avail = area.width.saturating_sub(gap_w.saturating_mul(n.saturating_sub(1)));
+            ((avail / n.max(1)).max(1), None, &compact_labels)
+        };
+    let content_w = box_w * n + gap_w * n.saturating_sub(1);
 
     let outer = Layout::default()
         .direction(Direction::Horizontal)
@@ -1106,12 +1132,12 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
                 .pixel_size(pixel_size)
                 .style(text_style)
                 .alignment(Alignment::Center)
-                .lines(vec![Line::from(glyph_labels[i].clone())])
+                .lines(vec![Line::from(labels[i].clone())])
                 .build();
             f.render_widget(glyph, center_v(inner, HERO_GLYPH_ROWS.min(inner.height)));
         } else {
             f.render_widget(
-                Paragraph::new(plain_labels[i].clone()).alignment(Alignment::Center).style(text_style),
+                Paragraph::new(labels[i].clone()).alignment(Alignment::Center).style(text_style),
                 center_v(inner, 1),
             );
         }
