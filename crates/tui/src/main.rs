@@ -25,6 +25,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
+use tui_big_text::{BigText, PixelSize};
 use scopeguard::defer;
 
 use guitar_trainer_core::audio;
@@ -716,6 +717,20 @@ const HERO_BOTTOM_MARGIN: u16 = 1;
 /// margins" between the three, per the one-column/3-row layout request).
 const HERO_SECTION_GAP: u16 = 2;
 
+/// Terminal rows/columns spanned by one glyph of the enlarged note-value
+/// text used for the note chips and the Detected value — rendered via
+/// `tui_big_text` at `PixelSize::HalfHeight` (not `Quadrant`, which was
+/// tried here before and rejected as too chunky/angular: both are 4 rows
+/// tall, but `HalfHeight` samples twice the horizontal detail per
+/// character, so diagonal strokes step more finely and read softer). Built
+/// from the same safe Block Elements range (▀▄█, U+2580-259F) already
+/// verified glitch-free in this terminal — see the Sextant→HalfHeight
+/// caption fix. Scoped to the note values only; the heading name/caption
+/// stay the existing crisp single-row text, which is where long prose
+/// (e.g. "B2 Mixolydian") was specifically hard to read as glyph text.
+const HERO_GLYPH_ROWS: u16 = 4;
+const HERO_GLYPH_COLS_PER_CHAR: u16 = 8;
+
 /// Dot-separated list of the currently enabled challenge categories, e.g.
 /// "Note · Chord · Scale". Shown on the Menu and Practice session panels so
 /// "what's enabled" is visible without opening Settings.
@@ -933,16 +948,55 @@ fn center_v(rect: Rect, content_h: u16) -> Rect {
     Rect { x: rect.x, y: rect.y + pad, width: rect.width, height: content_h }
 }
 
+/// Hand-drawn rounded border with heavier top/bottom/side rules than
+/// `BorderType::Rounded` — ratatui's box-drawing set has no glyph that is
+/// both heavy-weight *and* rounded at the corners, so this pairs the
+/// existing light rounded corners (╭╮╰╯, kept because the chips were
+/// explicitly approved for their rounded look) with heavy straight lines
+/// (━ ┃, the same Box Drawing block already used for the light rules
+/// elsewhere in this file — no new/unverified Unicode range). Returns the
+/// inner `Rect`, matching `Block::inner`.
+fn render_thick_rounded_border(f: &mut ratatui::Frame<'_>, area: Rect, style: Style) -> Rect {
+    if area.width < 2 || area.height < 2 {
+        return area;
+    }
+    let buf = f.buffer_mut();
+    let (x0, y0) = (area.x, area.y);
+    let (x1, y1) = (area.x + area.width - 1, area.y + area.height - 1);
+    buf.set_string(x0, y0, "╭", style);
+    buf.set_string(x1, y0, "╮", style);
+    buf.set_string(x0, y1, "╰", style);
+    buf.set_string(x1, y1, "╯", style);
+    if x1 > x0 + 1 {
+        let h = "━".repeat((x1 - x0 - 1) as usize);
+        buf.set_string(x0 + 1, y0, &h, style);
+        buf.set_string(x0 + 1, y1, &h, style);
+    }
+    for y in (y0 + 1)..y1 {
+        buf.set_string(x0, y, "┃", style);
+        buf.set_string(x1, y, "┃", style);
+    }
+    Rect::new(x0 + 1, y0 + 1, area.width.saturating_sub(2), area.height.saturating_sub(2))
+}
+
 /// The notes to actually play — the single most important piece of
 /// information during practice, and the hero panel's largest, boldest
-/// element. Each target is its own rounded bordered chip; the label
-/// renders as real terminal text — bold, letter-spaced, and colored —
-/// rather than block-glyph "big text": block-drawing pixel fonts read as
-/// chunky/retro no matter which resolution tier is picked, so weight and
-/// legibility now come from the type treatment (bold + spacing + color +
-/// the chip's own frame) instead of literal multi-row glyphs. Ordered
-/// prompts chain the chips with an arrow so the required sequence reads
-/// left to right; unordered prompts space them evenly.
+/// element. Each target is its own hand-drawn chip: a heavier-weight
+/// rounded border (`render_thick_rounded_border`, per the "thicker chip
+/// border" request) framing the note value rendered at
+/// `PixelSize::HalfHeight` — 4 terminal rows tall, the middle ground
+/// between the previous single-row crisp text (too small) and the full
+/// block-glyph rendering tried earlier in this file (too chunky/retro for
+/// prose, but fine for a 2-4 character note token — it reads like a
+/// tuner/pedal LCD digit, which fits the app). A checkmark glyph isn't in
+/// the underlying 8x8 font, so match state is carried by color alone
+/// (border + text turn green), the same convention already used by
+/// `render_detected_indicator`. Falls back to the previous single-row
+/// crisp letter-spaced text whenever the glyph rendering wouldn't fit the
+/// available width/height (narrow terminals, many simultaneous targets),
+/// so nothing is ever clipped. Ordered prompts chain the chips with an
+/// arrow so the required sequence reads left to right; unordered prompts
+/// space them evenly.
 fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
         return;
@@ -954,11 +1008,10 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let gap_w: u16 = if ui.ordered { 5 } else { 3 };
     let n = ui.targets.len() as u16;
 
-    // Letter-spaced label — the same crisp, real-font treatment used for
-    // the heading name — gives each note visual weight without resorting
-    // to a block-glyph pixel font.
     let spaced = |t: &str| -> String { t.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
-    let labels: Vec<String> = ui
+    // Crisp fallback labels keep the checkmark prefix; glyph labels drop
+    // it (unsupported by the 8x8 font) and rely on color for match state.
+    let plain_labels: Vec<String> = ui
         .targets
         .iter()
         .enumerate()
@@ -967,7 +1020,24 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
             if matched { format!("\u{2713} {}", spaced(t)) } else { spaced(t) }
         })
         .collect();
-    let box_w = labels.iter().map(|l| l.chars().count() as u16 + 6).max().unwrap_or(1);
+    // Glyph cells already have their own built-in per-character padding
+    // (the 8x8 font's own spacing), so — unlike the crisp fallback, which
+    // needs manual letter-spacing to avoid reading cramped — glyph labels
+    // skip it: keeps chips narrower, so more simultaneous targets (a
+    // 4-note progression/chord) actually qualify for the bigger glyph
+    // rendering instead of falling back.
+    let glyph_labels: Vec<String> = ui.targets.iter().map(|t| t.clone()).collect();
+
+    let plain_box_w = plain_labels.iter().map(|l| l.chars().count() as u16 + 6).max().unwrap_or(1);
+    let glyph_box_w = glyph_labels
+        .iter()
+        .map(|l| l.chars().count() as u16 * HERO_GLYPH_COLS_PER_CHAR + 6)
+        .max()
+        .unwrap_or(1);
+    let glyph_content_w = glyph_box_w * n + gap_w * n.saturating_sub(1);
+    let use_glyphs = glyph_content_w <= area.width && area.height >= HERO_GLYPH_ROWS + 2;
+
+    let box_w = if use_glyphs { glyph_box_w } else { plain_box_w };
     let content_w = (box_w * n + gap_w * n.saturating_sub(1)).min(area.width);
 
     let outer = Layout::default()
@@ -988,7 +1058,7 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         .split(outer[1]);
 
     let mut ci = 0usize;
-    for (i, label) in labels.iter().enumerate() {
+    for i in 0..ui.targets.len() {
         if i > 0 {
             if ui.ordered {
                 f.render_widget(
@@ -1002,16 +1072,21 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         let rect = cells[ci];
         ci += 1;
         let (border_style, text_style) = if matched { (success, success) } else { (idle_border, idle_text) };
-        let chip = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(border_style);
-        let chip_inner = chip.inner(rect);
-        f.render_widget(chip, rect);
-        f.render_widget(
-            Paragraph::new(label.clone()).alignment(Alignment::Center).style(text_style),
-            center_v(chip_inner, 1),
-        );
+        let inner = render_thick_rounded_border(f, rect, border_style);
+        if use_glyphs {
+            let glyph = BigText::builder()
+                .pixel_size(PixelSize::HalfHeight)
+                .style(text_style)
+                .alignment(Alignment::Center)
+                .lines(vec![Line::from(glyph_labels[i].clone())])
+                .build();
+            f.render_widget(glyph, center_v(inner, HERO_GLYPH_ROWS.min(inner.height)));
+        } else {
+            f.render_widget(
+                Paragraph::new(plain_labels[i].clone()).alignment(Alignment::Center).style(text_style),
+                center_v(inner, 1),
+            );
+        }
     }
 }
 
@@ -1037,20 +1112,20 @@ fn detected_correctness(ui: &UiState) -> Option<bool> {
 }
 
 /// What the mic currently hears — placed directly beneath the target-note
-/// chips (inside the hero panel) rather than squeezed into half of a row
-/// beside the Timer, and colored by correctness: green once the sounded
-/// note is one of the still-needed targets, red when a note is heard but
-/// it isn't one of them, neutral while nothing is detected. During the
-/// post-match cooldown it keeps the existing blink cue (already-confirmed
-/// success) instead of the correctness color. Renders as bold,
-/// letter-spaced real text — see `render_targets_row` for why block-glyph
-/// big text was dropped in favor of this crisper treatment.
+/// chips (inside the hero panel), colored by correctness: green once the
+/// sounded note is one of the still-needed targets, red when a note is
+/// heard but it isn't one of them, neutral while nothing is detected.
+/// During the post-match cooldown it keeps the existing blink cue
+/// (already-confirmed success) instead of the correctness color. An
+/// actual note renders at the same enlarged `PixelSize::HalfHeight` glyph
+/// size as the note chips (see `render_targets_row`) so the readout
+/// matches their weight; the idle "—" placeholder falls back to plain
+/// text — an em dash has no glyph in the underlying 8x8 font and would
+/// render blank.
 fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let raw = ui.detected_note.clone().unwrap_or_else(|| "—".to_string());
-    let text: String = raw.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
     let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
     let danger = Style::default().fg(theme_color(&theme.danger, Color::Red)).add_modifier(Modifier::BOLD);
     let neutral = Style::default().add_modifier(Modifier::BOLD);
@@ -1079,10 +1154,36 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
         .title(" Detected ");
     let inner = block.inner(area);
     f.render_widget(block, area);
-    f.render_widget(
-        Paragraph::new(text).alignment(Alignment::Center).style(text_style),
-        center_v(inner, 1),
-    );
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    match ui.detected_note.as_deref() {
+        Some(note) => {
+            let glyph_w = note.chars().count() as u16 * HERO_GLYPH_COLS_PER_CHAR;
+            if glyph_w <= inner.width && inner.height >= HERO_GLYPH_ROWS {
+                let glyph = BigText::builder()
+                    .pixel_size(PixelSize::HalfHeight)
+                    .style(text_style)
+                    .alignment(Alignment::Center)
+                    .lines(vec![Line::from(note.to_string())])
+                    .build();
+                f.render_widget(glyph, center_v(inner, HERO_GLYPH_ROWS));
+            } else {
+                let spaced: String = note.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+                f.render_widget(
+                    Paragraph::new(spaced).alignment(Alignment::Center).style(text_style),
+                    center_v(inner, 1),
+                );
+            }
+        }
+        None => {
+            f.render_widget(
+                Paragraph::new("—").alignment(Alignment::Center).style(text_style),
+                center_v(inner, 1),
+            );
+        }
+    }
 }
 
 /// The prompt name + match-count caption, boxed as its own bordered
