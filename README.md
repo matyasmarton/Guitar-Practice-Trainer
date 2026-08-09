@@ -18,9 +18,11 @@ sharing one real-time audio + pitch core (`guitar_trainer_core`).
 
 ## Tunings
 
-Three built-in tunings, cycled from the Settings screen's **Select tuning**
-picker (`Standard`, `All Fourths` — the default — and `Drop-D All Fourths`
-all ship movable-shape math for the all-fourths pair):
+Three built-in tunings, chosen from the Settings screen's **Select tuning**
+picker: `Standard`, `All Fourths` (the default), and `Drop-D All Fourths`.
+Movable chord/scale shapes hold across every root only on the two
+all-fourths tunings — `Standard` has the traditional major-third break
+between its G and B strings.
 
 | Tuning | Open strings (low → high) |
 |---|---|
