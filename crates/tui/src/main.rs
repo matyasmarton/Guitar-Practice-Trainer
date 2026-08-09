@@ -853,6 +853,7 @@ fn draw_menu(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Menu — ↑↓ select, Enter to activate "),
         )
         .highlight_style(selection_style(theme))
@@ -861,7 +862,10 @@ fn draw_menu(
     state.select(Some(app.menu_idx));
     f.render_stateful_widget(list, menu_area, &mut state);
 
-    let card_block = Block::default().borders(Borders::ALL).title(" Last Session ");
+    let card_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Last Session ");
     let card_inner = card_block.inner(card_area);
     f.render_widget(card_block, card_area);
     f.render_widget(
@@ -1052,18 +1056,28 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     // measured independently against the panel width, so e.g. a short
     // chord name renders big while a long Lick name with a note list
     // falls back to plain text on its own, never wrapping or clipping.
-    const BIG_COLS: u16 = 4;
-    const NAME_BIG_ROWS: u16 = 4; // PixelSize::Quadrant — matches the chip glyphs' height.
-    const CAPTION_BIG_ROWS: u16 = 3; // PixelSize::Sextant — one tier below the heading.
+    // Big-text glyphs render via ratatui's plain Block Elements (U+2580
+    // range) at Quadrant/HalfHeight — supported by every monospace
+    // terminal font. Sextant/ThirdHeight instead depend on the newer
+    // Legacy Computing Symbols block (U+1FB00+), which most terminal
+    // fonts (including macOS Terminal.app's defaults) ship no glyphs
+    // for — that combination is what rendered the subheading as
+    // unreadable tofu/`?`-box placeholders, so neither is used here.
+    const BIG_COLS_NAME: u16 = 4; // PixelSize::Quadrant — 2 source px per cell horizontally.
+    const NAME_BIG_ROWS: u16 = 4;
+    const BIG_COLS_CAPTION: u16 = 8; // PixelSize::HalfHeight — 1 source px per cell horizontally.
+    const CAPTION_BIG_ROWS: u16 = 4;
     // Below this inner height there isn't reliably room for a 4-row
-    // heading plus a 3-row subheading above the chip row's 5-row floor
+    // heading plus a 4-row subheading above the chip row's 5-row floor
     // and its own gaps; fall back to compact text rather than risk the
     // group overflowing the panel on a short terminal.
     const MIN_BIG_TEXT_INNER_H: u16 = 24;
-    let fits_big = |s: &str| -> bool { !s.is_empty() && (s.chars().count() as u16) * BIG_COLS <= inner.width };
+    let fits_big = |s: &str, cols_per_char: u16| -> bool {
+        !s.is_empty() && (s.chars().count() as u16) * cols_per_char <= inner.width
+    };
     let allow_big = inner.height >= MIN_BIG_TEXT_INNER_H;
-    let name_big = allow_big && fits_big(name);
-    let caption_big = allow_big && fits_big(&caption);
+    let name_big = allow_big && fits_big(name, BIG_COLS_NAME);
+    let caption_big = allow_big && fits_big(&caption, BIG_COLS_CAPTION);
 
     // Size the chip row last so the name + caption + chips group can be
     // measured as a single block and centered together, rather than
@@ -1112,7 +1126,7 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
 
     if caption_big {
         let big = BigText::builder()
-            .pixel_size(PixelSize::Sextant)
+            .pixel_size(PixelSize::HalfHeight)
             .style(caption_style)
             .centered()
             .lines(vec![Line::from(caption.clone())])
@@ -1305,9 +1319,10 @@ fn draw_practice(
 }
 
 fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
-    let outer = Block::default().borders(Borders::ALL).title(
-        " Settings — ↑↓ select, Enter to toggle/edit, Esc to save & back ",
-    );
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Settings — ↑↓ select, Enter to toggle/edit, Esc to save & back ");
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -1386,7 +1401,10 @@ fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, setti
         12 => "Save every change above and return to where you started.".to_string(),
         _ => String::new(),
     };
-    let block = Block::default().borders(Borders::ALL).title(" About ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" About ");
     let p = Paragraph::new(body)
         .block(block)
         .wrap(Wrap { trim: true })
@@ -1452,9 +1470,10 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
 }
 
 fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
-    let block = Block::default().borders(Borders::ALL).title(
-        " Audio Device — ↑↓ select, Enter to choose, Esc to cancel ",
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Audio Device — ↑↓ select, Enter to choose, Esc to cancel ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
