@@ -1534,7 +1534,7 @@ fn strip_octave(name: &str) -> &str {
 }
 
 /// The selected tuning's fretboard — the wide/full-screen Practice
-/// layout's right column, lower 2/3 (see `draw_practice`). Nut at the top,
+/// layout's right column, lower 4/5 (see `draw_practice`). Nut at the top,
 /// frets increasing downward, strings low→high left→right: the standard
 /// vertical chord-chart orientation, as if the guitar were held upright
 /// facing the reader. Every cell's note comes straight from
@@ -1604,17 +1604,38 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
 
     // 1 header row (string letters) + as many fret rows as fit, starting
     // from the open strings (fret 0) — never more than FRET_COUNT frets.
-    let frets_shown = inner.height.saturating_sub(1).min(FRET_COUNT as u16 + 1);
+    let frets_total = FRET_COUNT as u16 + 1;
+    let frets_shown = inner.height.saturating_sub(1).min(frets_total);
     if frets_shown == 0 {
         return; // too short even for one fret row — block/title still drew.
     }
-    let content_h = 1 + frets_shown;
+    let full_board = frets_shown == frets_total;
+    let base_h = 1 + frets_shown;
 
-    // Legend explaining the fret-marker dots (and, in highlight mode, the
-    // accent color) — only claimed when there's genuine slack beyond the
-    // table itself, so it never steals a row a shorter terminal needs to
-    // show another fret.
-    let show_legend = inner.height >= content_h + 2;
+    // Once the whole board already fits at one line per fret, spend any
+    // leftover height as 1-row breathing gaps *below* fret rows instead of
+    // padding it as blank centering space around the board — a real,
+    // measurable size increase (up to double the board's height) rather
+    // than just a bigger margin, on anything close to full screen. No
+    // fret is ever dropped to make room for this, unlike growing every
+    // row's height uniformly (which would need ~`frets_total` rows of
+    // slack before even the very first row could grow). Position markers
+    // get the first gaps — the natural break points on a real neck —
+    // then every other fret, until the budget or a full doubling (one gap
+    // per fret) is reached. The legend (below) is reserved first out of
+    // any slack, then whatever remains funds the gaps.
+    const GAP_PRIORITY_MARKERS: [u8; 9] = [3, 5, 7, 9, 12, 15, 17, 19, 21];
+    let slack = inner.height.saturating_sub(base_h);
+    let show_legend = full_board && slack >= 2;
+    let gap_budget = if full_board { slack.saturating_sub(if show_legend { 2 } else { 0 }).min(frets_total) } else { 0 };
+    let gap_frets: Vec<u8> = GAP_PRIORITY_MARKERS
+        .iter()
+        .copied()
+        .chain((0..=FRET_COUNT).filter(|f| !GAP_PRIORITY_MARKERS.contains(f)))
+        .take(gap_budget as usize)
+        .collect();
+    let content_h = base_h + gap_budget;
+
     let block_h = if show_legend { content_h + 2 } else { content_h };
 
     let cols = Layout::default()
@@ -1654,7 +1675,6 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
             centered_cell(label(strip_octave(&name)), header_style)
         }),
     ));
-
     let rows: Vec<Row> = (0..frets_shown as u8)
         .map(|fret| {
             let marker = if fret == FRET_DOUBLE_MARKER {
@@ -1671,7 +1691,8 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
                 let cell_style = if active.contains(&name.as_str()) { highlight_style } else { row_style };
                 centered_cell(label(&name), cell_style)
             });
-            Row::new(std::iter::once(gutter).chain(string_cells))
+            let bottom_margin = if gap_frets.contains(&fret) { 1 } else { 0 };
+            Row::new(std::iter::once(gutter).chain(string_cells)).bottom_margin(bottom_margin)
         })
         .collect();
 
@@ -1697,7 +1718,7 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
 /// Practice screen — depends on the wide/narrow/short thresholds below.
 enum SessionSlot {
     /// Wide/full-screen layout only: right column split into Session
-    /// (top 1/3) + Fretboard (bottom 2/3) — see `draw_practice`'s match.
+    /// (top 1/5) + Fretboard (bottom 4/5) — see `draw_practice`'s match.
     WidePanel(Rect),
     Panel(Rect),
     Line(Rect),
@@ -1829,7 +1850,7 @@ fn draw_practice(
         SessionSlot::WidePanel(rect) => {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+                .constraints([Constraint::Ratio(1, 5), Constraint::Ratio(4, 5)])
                 .split(rect);
             render_session_panel(f, rows[0], ui, settings, theme, wide);
             render_fretboard(f, rows[1], ui, settings, theme);
