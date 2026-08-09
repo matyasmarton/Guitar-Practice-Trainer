@@ -713,7 +713,7 @@ const HERO_HEADING_CONTENT_H: u16 = HERO_NAME_H + HERO_GAP1 + HERO_CAPTION_H;
 /// instead of stretched — keeps individual note chips a comfortable,
 /// unchanged size even though the section around them grows on a tall
 /// terminal.
-const HERO_CHIP_H: u16 = 9;
+const HERO_CHIP_H: u16 = 6;
 const HERO_BOTTOM_MARGIN: u16 = 1;
 /// Gap between the three subsections (Heading, Notes, Detected) — one
 /// constant so every gap between rows is identical ("even padding and
