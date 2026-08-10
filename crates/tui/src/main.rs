@@ -953,7 +953,7 @@ fn draw_menu(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Fill(1), Constraint::Length(3)])
+        .constraints([Constraint::Length(3), Constraint::Fill(1)])
         .split(area);
 
     let header = Paragraph::new(vec![
@@ -969,26 +969,22 @@ fn draw_menu(
     .alignment(Alignment::Center);
     f.render_widget(header, chunks[0]);
 
-    let list_h = (MENU_ITEMS.len() as u16 + 2).min(chunks[1].height);
-    let wide = is_wide(area);
-
-    let (menu_area, card_area) = if wide {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(30), Constraint::Fill(1)])
-            .split(chunks[1]);
-        let menu_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(list_h), Constraint::Fill(1)])
-            .split(cols[0]);
-        (menu_rows[1], cols[1])
-    } else {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_h), Constraint::Fill(1)])
-            .split(chunks[1]);
-        (rows[0], rows[1])
-    };
+    // Single column, two rows: the button list owns the lion's share of
+    // the screen (target 85%), while the "Last Session" summary plus the
+    // navigation/status line that used to live in its own footer chunk
+    // take the last 15% — clamped to a minimum so the card never
+    // shrinks to invisible on a short terminal (same guard style as
+    // `list_h` above). Replaces the old wide-terminal two-column split
+    // (buttons left, oversized description card right) with one layout
+    // that behaves the same at every terminal width.
+    let summary_lines = session_summary_lines(ui, settings, theme);
+    let card_min = (summary_lines.len() as u16 + 1 + 2).min(chunks[1].height);
+    let card_target = ((chunks[1].height as u32 * 15) / 100) as u16;
+    let card_h = card_target.max(card_min).min(chunks[1].height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Length(card_h)])
+        .split(chunks[1]);
 
     let items: Vec<ListItem> = MENU_ITEMS.iter().map(|s| ListItem::new(*s)).collect();
     let list = List::new(items)
@@ -996,24 +992,13 @@ fn draw_menu(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Menu — ↑↓ select, Enter to activate "),
+                .title(" Menu "),
         )
         .highlight_style(selection_style(theme))
         .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.menu_idx));
-    f.render_stateful_widget(list, menu_area, &mut state);
-
-    let card_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" Last Session ");
-    let card_inner = card_block.inner(card_area);
-    f.render_widget(card_block, card_area);
-    f.render_widget(
-        Paragraph::new(session_summary_lines(ui, settings, theme)).wrap(Wrap { trim: true }),
-        card_inner,
-    );
+    f.render_stateful_widget(list, rows[0], &mut state);
 
     let device_name = settings
         .audio_device
@@ -1022,14 +1007,31 @@ fn draw_menu(
     let (footer_text, footer_style) = match &ui.status {
         Some(msg) => (msg.clone(), Style::default().fg(theme_color(&theme.danger, Color::Red))),
         None => (
-            format!("mic: {device_name}   ✓{}/{}", ui.score_passed, ui.score_total),
+            format!("↑↓ select · Enter to activate    mic: {device_name}   ✓{}/{}", ui.score_passed, ui.score_total),
             Style::default().fg(theme_color(&theme.secondary, Color::Cyan)),
         ),
     };
-    let footer = Paragraph::new(footer_text)
-        .alignment(Alignment::Center)
-        .style(footer_style);
-    f.render_widget(footer, chunks[2]);
+
+    let card_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Last Session ");
+    let card_inner = card_block.inner(rows[1]);
+    f.render_widget(card_block, rows[1]);
+
+    let info_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Length(1)])
+        .split(card_inner);
+
+    f.render_widget(
+        Paragraph::new(summary_lines).wrap(Wrap { trim: true }),
+        info_rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(footer_text).alignment(Alignment::Center).style(footer_style),
+        info_rows[1],
+    );
 }
 
 /// Vertically centers a `content_h`-row block within `rect`, leaving any
