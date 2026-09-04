@@ -55,7 +55,11 @@ fn main() -> anyhow::Result<()> {
                 sum_sq += (s as f64) * (s as f64);
                 n += 1;
             }
-            let rms = if n > 0 { (sum_sq / n as f64).sqrt() } else { 0.0 };
+            let rms = if n > 0 {
+                (sum_sq / n as f64).sqrt()
+            } else {
+                0.0
+            };
             let _ = tx.send(peak.max(rms as f32));
         },
         |e| eprintln!("stream error: {e}"),
@@ -104,7 +108,10 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("could not re-open device by name"))?;
     let (ptx, prx) = crossbeam_channel::bounded(512);
     let input = AudioInput::start(Some(device2), 44100, ptx)?;
-    println!("  resolved: {} ch, {} Hz\n", input.channels, input.sample_rate);
+    println!(
+        "  resolved: {} ch, {} Hz\n",
+        input.channels, input.sample_rate
+    );
 
     let start2 = Instant::now();
     let mut total = 0u32;
@@ -132,7 +139,9 @@ fn main() -> anyhow::Result<()> {
     println!("Frames with a detected pitch: {voiced}");
     if total == 0 {
         println!("!! No PitchEvents arrived at all — the worker thread never accumulated");
-        println!("   a full frame. Check the stream actually started / device is producing samples.");
+        println!(
+            "   a full frame. Check the stream actually started / device is producing samples."
+        );
     } else if voiced == 0 {
         println!("!! Frames arrived but YIN never returned a pitch — either signal is too quiet");
         println!("   /noisy for the silence or threshold gates, or something about the real");

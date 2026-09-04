@@ -17,7 +17,10 @@ pub struct Piece {
 /// Resolve a `(pitch_class, octave)` pair to a MIDI note number.
 pub fn midi_of(pitch_class: u8, octave: u8) -> u8 {
     // midi = (octave + 1) * 12 + pc
-    octave.saturating_mul(12).saturating_add(12).saturating_add(pitch_class)
+    octave
+        .saturating_mul(12)
+        .saturating_add(12)
+        .saturating_add(pitch_class)
 }
 
 /// ~6 short openings. Intervals/pitches are the recognizable opening motifs.
@@ -62,7 +65,11 @@ mod tests {
     fn pieces_nonempty_and_short() {
         assert!(PIECES.len() >= 6);
         for p in PIECES {
-            assert!(!p.notes.is_empty() && p.notes.len() <= 8, "{} too long", p.name);
+            assert!(
+                !p.notes.is_empty() && p.notes.len() <= 8,
+                "{} too long",
+                p.name
+            );
             for &(pc, oct) in p.notes {
                 assert!(pc < 12);
                 assert!(midi_of(pc, oct) > 0);

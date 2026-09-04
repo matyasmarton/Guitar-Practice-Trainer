@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::Sender;
-use crossbeam_queue::ArrayQueue;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use crossbeam_channel::Sender;
+use crossbeam_queue::ArrayQueue;
 use tracing::{debug, warn};
 
 use crate::pitch::{detect, FRAME_SAMPLES, HOP_SAMPLES};
@@ -68,7 +68,10 @@ impl AudioInput {
         let (config, sample_rate, channels) = pick_config(&device, preferred_sample_rate)?;
         let fmt = cpal::SampleFormat::F32;
         if fmt != cpal::SampleFormat::F32 {
-            return Err(anyhow!("only F32 sample inputs are supported, got {:?}", fmt));
+            return Err(anyhow!(
+                "only F32 sample inputs are supported, got {:?}",
+                fmt
+            ));
         }
 
         // Lock-free sample ring shared between the real-time callback and worker.
@@ -101,10 +104,7 @@ impl AudioInput {
 pub fn enumerate_input_devices() -> Vec<String> {
     let host = cpal::default_host();
     host.input_devices()
-        .map(|it| {
-            it.filter_map(|d| d.name().ok())
-                .collect::<Vec<_>>()
-        })
+        .map(|it| it.filter_map(|d| d.name().ok()).collect::<Vec<_>>())
         .unwrap_or_default()
 }
 
@@ -120,10 +120,7 @@ pub fn find_device_by_name(name: &str) -> Option<cpal::Device> {
 // Internals
 // ---------------------------------------------------------------------------
 
-fn pick_config(
-    device: &cpal::Device,
-    preferred: u32,
-) -> Result<(StreamConfig, u32, u16)> {
+fn pick_config(device: &cpal::Device, preferred: u32) -> Result<(StreamConfig, u32, u16)> {
     // First choice: a supported F32 config with 1 channel and the preferred rate.
     if let Ok(ranges) = device.supported_input_configs() {
         for r in ranges {

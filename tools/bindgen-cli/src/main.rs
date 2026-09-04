@@ -11,8 +11,12 @@ use uniffi_bindgen::library_mode::generate_bindings;
 use uniffi_bindgen::BindgenCrateConfigSupplier;
 
 fn main() -> Result<()> {
-    let lib = std::env::args().nth(1).expect("usage: gtt-bindgen <library> <out_dir>");
-    let out = std::env::args().nth(2).expect("usage: gtt-bindgen <library> <out_dir>");
+    let lib = std::env::args()
+        .nth(1)
+        .expect("usage: gtt-bindgen <library> <out_dir>");
+    let out = std::env::args()
+        .nth(2)
+        .expect("usage: gtt-bindgen <library> <out_dir>");
     let library_path = Utf8PathBuf::from_path_buf(lib.into()).unwrap();
     let out_dir = Utf8PathBuf::from_path_buf(out.into()).unwrap();
 

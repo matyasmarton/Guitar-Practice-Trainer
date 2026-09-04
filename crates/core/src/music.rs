@@ -196,7 +196,12 @@ impl Mode {
 /// every output is a real fretted pitch reachable on `tuning` — each note is
 /// clamped to its own string's `open..=open+FRET_COUNT`, never to a global
 /// constant, so no note can land outside the active tuning's playable range.
-pub fn fret_voicing(tuning: &Tuning, bass_string: usize, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
+pub fn fret_voicing(
+    tuning: &Tuning,
+    bass_string: usize,
+    root_midi: u8,
+    intervals: &[i8],
+) -> Vec<u8> {
     let strings = tuning.open_strings;
     let mut out = Vec::with_capacity(intervals.len());
     for (i, &iv) in intervals.iter().enumerate() {
@@ -298,26 +303,14 @@ mod tests {
     #[test]
     fn scale_intervals_match_spec() {
         assert_eq!(ScaleType::Major.intervals(), &[0, 2, 4, 5, 7, 9, 11]);
-        assert_eq!(
-            ScaleType::NaturalMinor.intervals(),
-            &[0, 2, 3, 5, 7, 8, 10]
-        );
+        assert_eq!(ScaleType::NaturalMinor.intervals(), &[0, 2, 3, 5, 7, 8, 10]);
         assert_eq!(
             ScaleType::HarmonicMinor.intervals(),
             &[0, 2, 3, 5, 7, 8, 11]
         );
-        assert_eq!(
-            ScaleType::MelodicMinor.intervals(),
-            &[0, 2, 3, 5, 7, 9, 11]
-        );
-        assert_eq!(
-            ScaleType::PentatonicMajor.intervals(),
-            &[0, 2, 4, 7, 9]
-        );
-        assert_eq!(
-            ScaleType::PentatonicMinor.intervals(),
-            &[0, 3, 5, 7, 10]
-        );
+        assert_eq!(ScaleType::MelodicMinor.intervals(), &[0, 2, 3, 5, 7, 9, 11]);
+        assert_eq!(ScaleType::PentatonicMajor.intervals(), &[0, 2, 4, 7, 9]);
+        assert_eq!(ScaleType::PentatonicMinor.intervals(), &[0, 3, 5, 7, 10]);
         assert_eq!(ScaleType::Blues.intervals(), &[0, 3, 5, 6, 7, 10]);
     }
 
@@ -336,7 +329,12 @@ mod tests {
     fn fret_voicing_in_range_and_on_valid_frets() {
         for root in [MIDI_MIN, 45, 50, 55, 60] {
             for q in ChordQuality::ALL {
-                let notes = fret_voicing(&Tuning::builtin(TuningId::AllFourths), 0, root, q.intervals());
+                let notes = fret_voicing(
+                    &Tuning::builtin(TuningId::AllFourths),
+                    0,
+                    root,
+                    q.intervals(),
+                );
                 assert!(!notes.is_empty(), "empty voicing for {:?}", q);
                 for &n in &notes {
                     assert!(
@@ -346,9 +344,8 @@ mod tests {
                     );
                     // Each note is reachable on at least one string.
                     assert!(
-                        (0..6).any(|s| string_midi(TuningId::AllFourths, s, 0).map_or(false, |open| {
-                            n >= open && n - open <= FRET_COUNT
-                        })),
+                        (0..6).any(|s| string_midi(TuningId::AllFourths, s, 0)
+                            .map_or(false, |open| { n >= open && n - open <= FRET_COUNT })),
                         "voicing note {} not frettable",
                         n
                     );
@@ -366,9 +363,8 @@ mod tests {
                 for &n in &notes {
                     assert!((MIDI_MIN..=MIDI_MAX).contains(&n));
                     assert!(
-                        (0..6).any(|s_idx| string_midi(TuningId::AllFourths, s_idx, 0).map_or(false, |open| {
-                            n >= open && n - open <= FRET_COUNT
-                        })),
+                        (0..6).any(|s_idx| string_midi(TuningId::AllFourths, s_idx, 0)
+                            .map_or(false, |open| { n >= open && n - open <= FRET_COUNT })),
                         "scale note {} not frettable",
                         n
                     );
@@ -382,7 +378,12 @@ mod tests {
         // Root E2=40, Major [0,4,7]: string0 fret0=40, string1 fret? target 44 →
         // open 45 too high, so raise to 44+12=56 → string1 open 45 fret 11=56.
         // Then 47 → open50 too high, +12=59 → string2 fret 9. Ascending voicing.
-        let v = fret_voicing(&Tuning::builtin(TuningId::AllFourths), 0, 40, ChordQuality::Major.intervals());
+        let v = fret_voicing(
+            &Tuning::builtin(TuningId::AllFourths),
+            0,
+            40,
+            ChordQuality::Major.intervals(),
+        );
         assert_eq!(v.len(), 3);
         assert!(v.windows(2).all(|w| w[1] >= w[0]));
         for &n in &v {

@@ -23,13 +23,17 @@ pub enum TuningId {
 }
 
 impl TuningId {
-    pub const ALL: [TuningId; 3] = [TuningId::Standard, TuningId::AllFourths, TuningId::DropDAllFourths];
+    pub const ALL: [TuningId; 3] = [
+        TuningId::Standard,
+        TuningId::AllFourths,
+        TuningId::DropDAllFourths,
+    ];
 
     /// Open-string MIDI notes, low→high.
     pub const fn open_strings(self) -> [u8; 6] {
         match self {
-            TuningId::Standard => [40, 45, 50, 55, 59, 64],        // E2 A2 D3 G3 B3 E4
-            TuningId::AllFourths => [40, 45, 50, 55, 60, 65],      // E2 A2 D3 G3 C4 F4
+            TuningId::Standard => [40, 45, 50, 55, 59, 64], // E2 A2 D3 G3 B3 E4
+            TuningId::AllFourths => [40, 45, 50, 55, 60, 65], // E2 A2 D3 G3 C4 F4
             TuningId::DropDAllFourths => [38, 43, 48, 53, 58, 63], // D2 G2 C3 F3 A#3 D#4
         }
     }
@@ -57,7 +61,6 @@ impl TuningId {
     }
 }
 
-
 /// A concrete set of six open-string MIDI notes plus a display label: what
 /// every fret-arithmetic/UI function actually needs, whether the tuning is
 /// one of the three built-ins ([`TuningId`]) or a user-defined tuning (see
@@ -70,7 +73,10 @@ pub struct Tuning {
 
 impl Tuning {
     pub fn builtin(id: TuningId) -> Self {
-        Tuning { label: id.label().to_string(), open_strings: id.open_strings() }
+        Tuning {
+            label: id.label().to_string(),
+            open_strings: id.open_strings(),
+        }
     }
 
     /// Same "lowest open string .. highest string fretted to FRET_COUNT" math
@@ -144,7 +150,11 @@ mod tests {
     fn standard_tuning_has_major_third_break() {
         let strings = TuningId::Standard.open_strings();
         let gaps: Vec<u8> = strings.windows(2).map(|w| w[1] - w[0]).collect();
-        assert_eq!(gaps, vec![5, 5, 5, 4, 5], "standard tuning breaks the P4 pattern between G and B");
+        assert_eq!(
+            gaps,
+            vec![5, 5, 5, 4, 5],
+            "standard tuning breaks the P4 pattern between G and B"
+        );
     }
 
     #[test]

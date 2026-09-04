@@ -19,6 +19,7 @@ pub mod pieces;
 pub mod pitch;
 pub mod progressions;
 pub mod theme;
+pub mod tones;
 pub mod tuning;
 
 #[cfg(feature = "uniffi")]

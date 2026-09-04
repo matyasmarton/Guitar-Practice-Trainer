@@ -22,7 +22,10 @@ pub struct CustomTuning {
 
 impl CustomTuning {
     pub fn to_tuning(&self) -> Tuning {
-        Tuning { label: self.name.clone(), open_strings: self.open_strings }
+        Tuning {
+            label: self.name.clone(),
+            open_strings: self.open_strings,
+        }
     }
 }
 
@@ -154,7 +157,10 @@ pub fn parse_custom_tunings(text: &str) -> Result<Vec<CustomTuning>> {
                 Note::from_midi_clamped(MIDI_MAX).name(),
             );
         }
-        out.push(CustomTuning { name: entry.name, open_strings });
+        out.push(CustomTuning {
+            name: entry.name,
+            open_strings,
+        });
     }
     Ok(out)
 }
@@ -180,7 +186,8 @@ mod tests {
 
     #[test]
     fn rejects_descending_strings() {
-        let text = "[[tunings]]\nname = \"X\"\nstrings = [\"D3\",\"A2\",\"D3\",\"G3\",\"B3\",\"D4\"]\n";
+        let text =
+            "[[tunings]]\nname = \"X\"\nstrings = [\"D3\",\"A2\",\"D3\",\"G3\",\"B3\",\"D4\"]\n";
         assert!(parse_custom_tunings(text).is_err());
     }
 
@@ -193,15 +200,22 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_when_custom_name_missing() {
-        let active = ActiveTuning::Custom { name: "Nope".to_string() };
+        let active = ActiveTuning::Custom {
+            name: "Nope".to_string(),
+        };
         let t = resolve_tuning(&active, &[]);
         assert_eq!(t.open_strings, TuningId::default().open_strings());
     }
 
     #[test]
     fn resolve_finds_custom_by_name() {
-        let custom = CustomTuning { name: "Open D".to_string(), open_strings: [38, 45, 50, 54, 57, 62] };
-        let active = ActiveTuning::Custom { name: "Open D".to_string() };
+        let custom = CustomTuning {
+            name: "Open D".to_string(),
+            open_strings: [38, 45, 50, 54, 57, 62],
+        };
+        let active = ActiveTuning::Custom {
+            name: "Open D".to_string(),
+        };
         let t = resolve_tuning(&active, &[custom]);
         assert_eq!(t.open_strings, [38, 45, 50, 54, 57, 62]);
     }

@@ -60,7 +60,10 @@ fn main() -> anyhow::Result<()> {
     engine.stop();
 
     let log = log.lock();
-    let detected_count = log.iter().filter(|l| l.starts_with("DETECTED: Some")).count();
+    let detected_count = log
+        .iter()
+        .filter(|l| l.starts_with("DETECTED: Some"))
+        .count();
     let prompt_count = log.iter().filter(|l| l.starts_with("PROMPT")).count();
     println!("\n=== Summary ===");
     println!("Total engine events: {}", log.len());

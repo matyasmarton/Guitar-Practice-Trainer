@@ -146,8 +146,7 @@ pub fn parse_custom(text: &str) -> Result<CustomContent> {
         // If the document has a `[[licks]]` table but failed to parse, surface
         // the error rather than silently dropping licks.
         if text.contains("[[licks]]") {
-            toml::from_str::<CustomLickFile>(text)
-                .context("parsing custom licks")?;
+            toml::from_str::<CustomLickFile>(text).context("parsing custom licks")?;
         }
     }
 
@@ -160,16 +159,22 @@ pub fn parse_custom(text: &str) -> Result<CustomContent> {
             let mut notes = Vec::with_capacity(c.notes.len());
             for [pc, oct] in c.notes {
                 if pc >= 12 {
-                    anyhow::bail!("custom piece '{}' has pitch_class {} (must be 0..11)", c.name, pc);
+                    anyhow::bail!(
+                        "custom piece '{}' has pitch_class {} (must be 0..11)",
+                        c.name,
+                        pc
+                    );
                 }
                 notes.push((pc, oct));
                 let _ = midi_of(pc, oct); // sanity (no overflow expected)
             }
-            out.pieces.push(PieceItem { name: c.name, notes });
+            out.pieces.push(PieceItem {
+                name: c.name,
+                notes,
+            });
         }
     } else if text.contains("[[pieces]]") {
-        toml::from_str::<CustomPieceFile>(text)
-            .context("parsing custom pieces")?;
+        toml::from_str::<CustomPieceFile>(text).context("parsing custom pieces")?;
     }
 
     if out.licks.is_empty() && out.pieces.is_empty() {

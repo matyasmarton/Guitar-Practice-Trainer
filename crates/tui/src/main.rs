@@ -17,25 +17,29 @@ use std::time::Duration;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Terminal;
-use tui_big_text::{BigText, PixelSize};
 use scopeguard::defer;
+use tui_big_text::{BigText, PixelSize};
 
 use guitar_trainer_core::audio;
 use guitar_trainer_core::challenges::ChallengeType;
-use guitar_trainer_core::config::{Config, EnabledCategory};
+use guitar_trainer_core::config::{Config, EarTrainingMode, EnabledCategory};
+use guitar_trainer_core::custom_tuning::{ActiveTuning, CustomTuning};
 use guitar_trainer_core::engine::{Engine, EngineEvent, EngineListener};
 use guitar_trainer_core::note::Note;
 use guitar_trainer_core::theme::Theme;
 use guitar_trainer_core::tuning::{Tuning, TuningId, FRET_COUNT};
-use guitar_trainer_core::custom_tuning::{ActiveTuning, CustomTuning};
 
 /// One completed prompt, kept for the Practice screen's "recent attempts"
 /// list (see `UiState::history`). Built purely from events the engine
@@ -88,6 +92,10 @@ struct UiState {
     /// Moment a hard-mode mistake reset happened; renders a flash in the
     /// heading caption until now+1500ms.
     mistake_until: Option<std::time::Instant>,
+    /// Ear-training prompt: note names stay masked until matched.
+    listen: bool,
+    /// Live "audio is sounding" cue, polled from the engine each frame.
+    sounding: bool,
 }
 
 /// Channel-backed listener: the render loop drains `rx`.
@@ -124,10 +132,10 @@ enum Edit {
     Path,
     TuningPath,
 }
-/// Settings rows: 0=Timer 1=Select tuning 2=Add custom tuning 3=Fretboard highlight 4=Random 5=Hard difficulty 6..=12=categories(7) 13=Audio Device 14=Custom Content Path 15=Back.
-const SETTINGS_ROW_COUNT: usize = 16;
+/// Settings rows: 0=Timer 1=Select tuning 2=Add custom tuning 3=Fretboard highlight 4=Random 5=Hard difficulty 6=Ear training 7..=13=categories(7) 14=Audio Device 15=Custom Content Path 16=Back.
+const SETTINGS_ROW_COUNT: usize = 17;
 const MENU_ITEMS: [&str; 3] = ["Start Practice", "Settings", "Quit"];
-const PRACTICE_ACTIONS: [&str; 3] = ["Stop", "Skip", "Settings"];
+const PRACTICE_ACTIONS: [&str; 4] = ["Stop", "Skip", "Replay", "Settings"];
 
 struct App {
     screen: Screen,
@@ -222,9 +230,10 @@ fn main() -> Result<()> {
                 // Accept Press + Repeat, reject Release — robust across
                 // terminals that report key-up events (e.g. Kitty protocol).
                 if k.kind != KeyEventKind::Release
-                    && !handle_key(k, &mut app, &mut settings, &engine, &mut ui) {
-                        break; // Quit requested.
-                    }
+                    && !handle_key(k, &mut app, &mut settings, &engine, &mut ui)
+                {
+                    break; // Quit requested.
+                }
             }
         }
 
@@ -237,7 +246,9 @@ fn main() -> Result<()> {
                 Screen::Settings => draw_settings(f, area, &app, &settings, &theme),
                 Screen::DevicePick => draw_device_pick(f, area, &app, &settings, &theme),
                 Screen::TuningPick => draw_tuning_pick(f, area, &app, &settings, &theme),
-                Screen::CustomTuningHelp => draw_custom_tuning_help(f, area, &app, &settings, &theme),
+                Screen::CustomTuningHelp => {
+                    draw_custom_tuning_help(f, area, &app, &settings, &theme)
+                }
             }
         })?;
     }
@@ -259,6 +270,7 @@ fn drain_events(rx: &Receiver<EngineEvent>, ui: &mut UiState, engine: &Engine) {
         }
     }
     // Refresh progress every frame (the timer advances on the engine thread).
+    ui.sounding = engine.sounding();
     let (frac, secs, total) = engine.progress();
     ui.time_left_frac = frac;
     ui.time_left_secs = secs;
@@ -287,6 +299,7 @@ fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
             ui.prompt_kind = v.kind.clone();
             ui.targets = v.targets.clone();
             ui.ordered = v.ordered;
+            ui.listen = v.listen;
             ui.matched = 0;
             ui.matched_indices = vec![false; v.targets.len()];
         }
@@ -333,6 +346,7 @@ struct SettingsState {
     random_mode: bool,
     hard_sequence: bool,
     fretboard_highlight: bool,
+    ear_training: EarTrainingMode,
     custom_path: String,
     audio_device: Option<String>,
     /// Not user-editable in this screen; preserved so saving other settings
@@ -364,6 +378,7 @@ impl SettingsState {
             random_mode: cfg.random_mode,
             hard_sequence: cfg.hard_sequence,
             fretboard_highlight: cfg.fretboard_highlight,
+            ear_training: cfg.ear_training,
             custom_path: cfg
                 .custom_content_path
                 .as_ref()
@@ -390,6 +405,7 @@ impl SettingsState {
             enabled: set,
             random_mode: self.random_mode,
             fretboard_highlight: self.fretboard_highlight,
+            ear_training: self.ear_training,
             hard_sequence: self.hard_sequence,
             custom_content_path: if self.custom_path.is_empty() {
                 None
@@ -462,7 +478,9 @@ fn handle_key(
             KeyCode::Char(c) => {
                 let ok = match app.edit {
                     Edit::Timer => c.is_ascii_digit() && app.edit_buf.len() < 4,
-                    Edit::Path | Edit::TuningPath => (c.is_ascii_graphic() || c == ' ') && app.edit_buf.len() < 200,
+                    Edit::Path | Edit::TuningPath => {
+                        (c.is_ascii_graphic() || c == ' ') && app.edit_buf.len() < 200
+                    }
                     Edit::None => false,
                 };
                 if ok {
@@ -565,7 +583,8 @@ fn handle_practice_key(
 ) -> bool {
     match k.code {
         KeyCode::Left => {
-            app.practice_idx = (app.practice_idx + PRACTICE_ACTIONS.len() - 1) % PRACTICE_ACTIONS.len()
+            app.practice_idx =
+                (app.practice_idx + PRACTICE_ACTIONS.len() - 1) % PRACTICE_ACTIONS.len()
         }
         KeyCode::Right => app.practice_idx = (app.practice_idx + 1) % PRACTICE_ACTIONS.len(),
         KeyCode::Enter | KeyCode::Char(' ') => match app.practice_idx {
@@ -576,7 +595,8 @@ fn handle_practice_key(
                 app.menu_idx = 0;
             }
             1 => engine.skip(),
-            2 => {
+            2 => engine.replay(),
+            3 => {
                 *settings = SettingsState::from_engine(engine);
                 app.settings_idx = 0;
                 app.screen = Screen::Settings;
@@ -595,6 +615,7 @@ fn handle_practice_key(
             // persisted default).
             engine.set_config(settings.to_config());
         }
+        KeyCode::Char('r' | 'R') => engine.replay(),
         _ => {}
     }
     true
@@ -619,7 +640,10 @@ fn handle_settings_key(
             }
             1 => {
                 let candidates = tuning_pick_candidates(settings);
-                app.tuning_pick_idx = candidates.iter().position(|c| *c == settings.tuning).unwrap_or(0);
+                app.tuning_pick_idx = candidates
+                    .iter()
+                    .position(|c| *c == settings.tuning)
+                    .unwrap_or(0);
                 app.screen = Screen::TuningPick;
             }
             2 => {
@@ -628,13 +652,14 @@ fn handle_settings_key(
             3 => settings.fretboard_highlight = !settings.fretboard_highlight,
             4 => settings.random_mode = !settings.random_mode,
             5 => settings.hard_sequence = !settings.hard_sequence,
-            6..=12 => {
-                let i = app.settings_idx - 6;
+            6 => settings.ear_training = settings.ear_training.cycle(),
+            7..=13 => {
+                let i = app.settings_idx - 7;
                 if let Some(slot) = settings.enabled.get_mut(i) {
                     slot.1 = !slot.1;
                 }
             }
-            13 => {
+            14 => {
                 start_device_scan(app);
                 app.device_idx = settings
                     .audio_device
@@ -643,19 +668,27 @@ fn handle_settings_key(
                     .unwrap_or(0);
                 app.screen = Screen::DevicePick;
             }
-            14 => {
+            15 => {
                 app.edit = Edit::Path;
                 app.edit_buf = settings.custom_path.clone();
             }
-            15 => {
+            16 => {
                 apply_settings(settings, engine);
-                app.screen = if ui.running { Screen::Practice } else { Screen::Menu };
+                app.screen = if ui.running {
+                    Screen::Practice
+                } else {
+                    Screen::Menu
+                };
             }
             _ => {}
         },
         KeyCode::Esc => {
             apply_settings(settings, engine);
-            app.screen = if ui.running { Screen::Practice } else { Screen::Menu };
+            app.screen = if ui.running {
+                Screen::Practice
+            } else {
+                Screen::Menu
+            };
         }
         _ => {}
     }
@@ -864,27 +897,37 @@ const HERO_GLYPH_COLS_PER_CHAR_NARROW: u16 = 4;
 /// existing crisp letter-spaced text instead.
 const HERO_NAME_GLYPH_ROWS: u16 = 8;
 
-/// Dot-separated list of the currently enabled challenge categories, e.g.
-/// "Note · Chord · Scale". Shown on the Menu and Practice session panels so
-/// "what's enabled" is visible without opening Settings.
+/// Mode label for the Menu/Session category line. While ear training is on the
+/// enabled categories are ignored by the generator, so the chips stay
+/// truthful by naming the mode instead.
 fn category_chips(settings: &SettingsState) -> String {
-    let on: Vec<&str> = settings
-        .enabled
-        .iter()
-        .filter(|(_, on)| *on)
-        .map(|(c, _)| c.label())
-        .collect();
-    if on.is_empty() {
-        "(none enabled)".to_string()
-    } else {
-        on.join(" · ")
+    match settings.ear_training {
+        EarTrainingMode::Single => "Ear training (Single note)".to_string(),
+        EarTrainingMode::Sequence => "Ear training (Consecutive notes)".to_string(),
+        EarTrainingMode::Off => {
+            let on: Vec<&str> = settings
+                .enabled
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(c, _)| c.label())
+                .collect();
+            if on.is_empty() {
+                "(none enabled)".to_string()
+            } else {
+                on.join(" · ")
+            }
+        }
     }
 }
 
 /// Score / device / tuning / categories — the read-only session facts shown
 /// on both the Menu's "Last Session" card and the Practice screen's Session
 /// panel, built once so the two can never drift apart.
-fn session_summary_lines(ui: &UiState, settings: &SettingsState, theme: &Theme) -> Vec<Line<'static>> {
+fn session_summary_lines(
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let device_name = settings
         .audio_device
         .clone()
@@ -894,9 +937,15 @@ fn session_summary_lines(ui: &UiState, settings: &SettingsState, theme: &Theme) 
     vec![
         Line::from(vec![
             Span::styled("Score      ", label_style),
-            Span::styled(format!("✓ {}/{}", ui.score_passed, ui.score_total), value_style),
+            Span::styled(
+                format!("✓ {}/{}", ui.score_passed, ui.score_total),
+                value_style,
+            ),
         ]),
-        Line::from(vec![Span::styled("Device     ", label_style), Span::raw(device_name)]),
+        Line::from(vec![
+            Span::styled("Device     ", label_style),
+            Span::raw(device_name),
+        ]),
         Line::from(vec![
             Span::styled("Tuning     ", label_style),
             Span::raw(settings.resolved_tuning().label),
@@ -937,14 +986,20 @@ fn render_session_panel(
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(summary_h), Constraint::Length(1), Constraint::Fill(1)])
+        .constraints([
+            Constraint::Length(summary_h),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
         .split(inner);
 
     f.render_widget(Paragraph::new(summary).wrap(Wrap { trim: true }), rows[0]);
     f.render_widget(
         Paragraph::new(Span::styled(
             "Recent",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         )),
         rows[1],
     );
@@ -971,7 +1026,10 @@ fn render_session_panel(
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{mark} "), style),
-                    Span::styled(format!("{:<11}", a.kind), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:<11}", a.kind),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::raw(a.display.clone()),
                 ]))
             })
@@ -1042,9 +1100,15 @@ fn draw_menu(
         .clone()
         .unwrap_or_else(|| "(default mic)".to_string());
     let (footer_text, footer_style) = match &ui.status {
-        Some(msg) => (msg.clone(), Style::default().fg(theme_color(&theme.danger, Color::Red))),
+        Some(msg) => (
+            msg.clone(),
+            Style::default().fg(theme_color(&theme.danger, Color::Red)),
+        ),
         None => (
-            format!("↑↓ select · Enter to activate    mic: {device_name}   ✓{}/{}", ui.score_passed, ui.score_total),
+            format!(
+                "↑↓ select · Enter to activate    mic: {device_name}   ✓{}/{}",
+                ui.score_passed, ui.score_total
+            ),
             Style::default().fg(theme_color(&theme.secondary, Color::Cyan)),
         ),
     };
@@ -1066,7 +1130,9 @@ fn draw_menu(
         info_rows[0],
     );
     f.render_widget(
-        Paragraph::new(footer_text).alignment(Alignment::Center).style(footer_style),
+        Paragraph::new(footer_text)
+            .alignment(Alignment::Center)
+            .style(footer_style),
         info_rows[1],
     );
 }
@@ -1080,7 +1146,12 @@ fn center_v(rect: Rect, content_h: u16) -> Rect {
         return rect;
     }
     let pad = (rect.height - content_h) / 2;
-    Rect { x: rect.x, y: rect.y + pad, width: rect.width, height: content_h }
+    Rect {
+        x: rect.x,
+        y: rect.y + pad,
+        width: rect.width,
+        height: content_h,
+    }
 }
 
 /// Hand-drawn rounded border with heavier top/bottom/side rules than
@@ -1122,7 +1193,12 @@ fn render_thick_rounded_border(
         buf.set_string(x0, y, "┃", style);
         buf.set_string(x1, y, "┃", style);
     }
-    Rect::new(x0 + 1, y0 + 1, area.width.saturating_sub(2), area.height.saturating_sub(2))
+    Rect::new(
+        x0 + 1,
+        y0 + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
 }
 
 /// The notes to actually play — the single most important piece of
@@ -1157,26 +1233,63 @@ fn render_thick_rounded_border(
 /// still-needed chip carries a colored underscore (its bottom border rule
 /// in `target_color(i)`) matching that note's cells on the fretboard;
 /// matched chips drop the underscore and turn fully green.
-fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme, highlight: bool) {
+/// Chip labels for the current prompt: real note names unless the prompt is a
+/// listen-and-repeat one, in which case unmatched chips render as `"?"` and
+/// matched chips reveal their names (the reveal is the reward).
+fn masked_target_labels(ui: &UiState) -> Vec<String> {
+    ui.targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if ui.listen && !ui.matched_indices.get(i).copied().unwrap_or(false) {
+                "?".to_string()
+            } else {
+                t.clone()
+            }
+        })
+        .collect()
+}
+
+fn render_targets_row(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    theme: &Theme,
+    highlight: bool,
+) {
     if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
-    let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
+    let success = Style::default()
+        .fg(theme_color(&theme.success, Color::Green))
+        .add_modifier(Modifier::BOLD);
     let idle_border = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
-    let idle_text = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
+    let idle_text = Style::default()
+        .fg(theme_color(&theme.secondary, Color::Cyan))
+        .add_modifier(Modifier::BOLD);
 
     let gap_w: u16 = if ui.ordered { 5 } else { 3 };
     let n = ui.targets.len() as u16;
 
-    let spaced = |t: &str| -> String { t.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
+    let spaced = |t: &str| -> String {
+        t.chars()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let targets = masked_target_labels(ui);
     let crisp_labels = |space: bool| -> Vec<String> {
-        ui.targets
+        targets
             .iter()
             .enumerate()
             .map(|(i, t)| {
                 let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
                 let body = if space { spaced(t) } else { t.clone() };
-                if matched { format!("\u{2713} {body}") } else { body }
+                if matched {
+                    format!("\u{2713} {body}")
+                } else {
+                    body
+                }
             })
             .collect()
     };
@@ -1185,12 +1298,20 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     // need manual letter-spacing to avoid reading cramped — glyph labels
     // skip it: keeps chips narrower, so more simultaneous targets qualify
     // for glyph rendering instead of falling back.
-    let glyph_labels: Vec<String> = ui.targets.iter().cloned().collect();
+    let glyph_labels: Vec<String> = targets.to_vec();
     let spaced_labels = crisp_labels(true);
     let compact_labels = crisp_labels(false);
 
-    let max_chars = |labels: &[String]| labels.iter().map(|l| l.chars().count() as u16).max().unwrap_or(1);
-    let fits = |box_w: u16| box_w.saturating_mul(n) + gap_w.saturating_mul(n.saturating_sub(1)) <= area.width;
+    let max_chars = |labels: &[String]| {
+        labels
+            .iter()
+            .map(|l| l.chars().count() as u16)
+            .max()
+            .unwrap_or(1)
+    };
+    let fits = |box_w: u16| {
+        box_w.saturating_mul(n) + gap_w.saturating_mul(n.saturating_sub(1)) <= area.width
+    };
     let fits_height = area.height >= HERO_GLYPH_ROWS + 2;
 
     let glyph_chars = max_chars(&glyph_labels);
@@ -1216,14 +1337,20 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
             // constraints it can only satisfy by compressing some cells
             // more than others — that silent compression was the root
             // cause of the reported bug.
-            let avail = area.width.saturating_sub(gap_w.saturating_mul(n.saturating_sub(1)));
+            let avail = area
+                .width
+                .saturating_sub(gap_w.saturating_mul(n.saturating_sub(1)));
             ((avail / n.max(1)).max(1), None, &compact_labels)
         };
     let content_w = box_w * n + gap_w * n.saturating_sub(1);
 
     let outer = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Fill(1), Constraint::Length(content_w), Constraint::Fill(1)])
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(content_w),
+            Constraint::Fill(1),
+        ])
         .split(area);
 
     let mut cell_constraints = Vec::with_capacity(ui.targets.len() * 2);
@@ -1243,7 +1370,9 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         if i > 0 {
             if ui.ordered {
                 f.render_widget(
-                    Paragraph::new("→").alignment(Alignment::Center).style(idle_border),
+                    Paragraph::new("→")
+                        .alignment(Alignment::Center)
+                        .style(idle_border),
                     center_v(cells[ci], 1),
                 );
             }
@@ -1252,7 +1381,11 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
         let rect = cells[ci];
         ci += 1;
-        let (border_style, text_style) = if matched { (success, success) } else { (idle_border, idle_text) };
+        let (border_style, text_style) = if matched {
+            (success, success)
+        } else {
+            (idle_border, idle_text)
+        };
         let bottom = if highlight && !matched {
             Some(Style::default().fg(target_color(i, theme)))
         } else {
@@ -1269,7 +1402,9 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
             f.render_widget(glyph, center_v(inner, HERO_GLYPH_ROWS.min(inner.height)));
         } else {
             f.render_widget(
-                Paragraph::new(labels[i].clone()).alignment(Alignment::Center).style(text_style),
+                Paragraph::new(labels[i].clone())
+                    .alignment(Alignment::Center)
+                    .style(text_style),
                 center_v(inner, 1),
             );
         }
@@ -1291,9 +1426,12 @@ fn detected_correctness(ui: &UiState) -> Option<bool> {
         let next = ui.matched_indices.iter().position(|m| !m)?;
         Some(ui.targets.get(next).map(String::as_str) == Some(note))
     } else {
-        Some(ui.targets.iter().enumerate().any(|(i, t)| {
-            !ui.matched_indices.get(i).copied().unwrap_or(false) && t == note
-        }))
+        Some(
+            ui.targets
+                .iter()
+                .enumerate()
+                .any(|(i, t)| !ui.matched_indices.get(i).copied().unwrap_or(false) && t == note),
+        )
     }
 }
 
@@ -1391,6 +1529,40 @@ mod target_highlight_colors_tests {
     }
 }
 
+#[cfg(test)]
+mod masked_target_labels_tests {
+    use super::*;
+
+    fn ui_with(targets: &[&str], matched: &[bool], listen: bool) -> UiState {
+        UiState {
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            matched_indices: matched.to_vec(),
+            listen,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn non_listen_prompts_show_real_names() {
+        let ui = ui_with(&["A2", "B2"], &[false, true], false);
+        assert_eq!(masked_target_labels(&ui), vec!["A2", "B2"]);
+    }
+
+    #[test]
+    fn listen_single_masks_then_reveals_after_match() {
+        let ui = ui_with(&["A2"], &[false], true);
+        assert_eq!(masked_target_labels(&ui), vec!["?"]);
+        let ui = ui_with(&["A2"], &[true], true);
+        assert_eq!(masked_target_labels(&ui), vec!["A2"]);
+    }
+
+    #[test]
+    fn listen_sequence_keeps_later_notes_masked_after_first_match() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[true, false, false], true);
+        assert_eq!(masked_target_labels(&ui), vec!["A2", "?", "?"]);
+    }
+}
+
 /// What the mic currently hears — placed directly beneath the target-note
 /// chips (inside the hero panel), colored by correctness: green once the
 /// sounded note is one of the still-needed targets, red when a note is
@@ -1406,8 +1578,12 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let success = Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD);
-    let danger = Style::default().fg(theme_color(&theme.danger, Color::Red)).add_modifier(Modifier::BOLD);
+    let success = Style::default()
+        .fg(theme_color(&theme.success, Color::Green))
+        .add_modifier(Modifier::BOLD);
+    let danger = Style::default()
+        .fg(theme_color(&theme.danger, Color::Red))
+        .add_modifier(Modifier::BOLD);
     let neutral = Style::default().add_modifier(Modifier::BOLD);
     let idle_border = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
 
@@ -1417,7 +1593,11 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
         .unwrap_or(false);
     let (text_style, border_style) = if cooldown_active {
         let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200).is_multiple_of(2);
-        let s = if blink_on { success.add_modifier(Modifier::REVERSED) } else { success };
+        let s = if blink_on {
+            success.add_modifier(Modifier::REVERSED)
+        } else {
+            success
+        };
         (s, success)
     } else {
         match detected_correctness(ui) {
@@ -1450,16 +1630,24 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
                     .build();
                 f.render_widget(glyph, center_v(inner, HERO_GLYPH_ROWS));
             } else {
-                let spaced: String = note.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
+                let spaced: String = note
+                    .chars()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 f.render_widget(
-                    Paragraph::new(spaced).alignment(Alignment::Center).style(text_style),
+                    Paragraph::new(spaced)
+                        .alignment(Alignment::Center)
+                        .style(text_style),
                     center_v(inner, 1),
                 );
             }
         }
         None => {
             f.render_widget(
-                Paragraph::new("—").alignment(Alignment::Center).style(text_style),
+                Paragraph::new("—")
+                    .alignment(Alignment::Center)
+                    .style(text_style),
                 center_v(inner, 1),
             );
         }
@@ -1493,24 +1681,37 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     }
 
     let name = ui.prompt_display.trim();
-    let mistake_flash = ui.mistake_until.map_or(false, |t| std::time::Instant::now() < t) && ui.ordered;
+    let mistake_flash = ui
+        .mistake_until
+        .is_some_and(|t| std::time::Instant::now() < t)
+        && ui.ordered;
     let caption = if mistake_flash {
         "MISTAKE — START OVER".to_string()
+    } else if ui.sounding {
+        "LISTEN…".to_string()
     } else if ui.ordered {
         format!("{} OF {} MATCHED — IN ORDER", ui.matched, ui.targets.len())
     } else {
         format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
     };
     // Heading: accent yellow — the first colored thing the eye lands on.
-    let name_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
+    let name_style = Style::default()
+        .fg(theme_color(&theme.accent, Color::Yellow))
+        .add_modifier(Modifier::BOLD);
     // Subheading: red flash right after a hard-mode mistake, cyan by
     // default, switching to green once progress starts.
     let caption_style = if mistake_flash {
-        Style::default().fg(theme_color(&theme.danger, Color::Red)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme_color(&theme.danger, Color::Red))
+            .add_modifier(Modifier::BOLD)
     } else if ui.matched > 0 {
-        Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme_color(&theme.success, Color::Green))
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme_color(&theme.secondary, Color::Cyan))
+            .add_modifier(Modifier::BOLD)
     };
 
     // Reserve the fixed name+gap+caption budget, centered within whatever
@@ -1519,7 +1720,11 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let content = center_v(inner, HERO_HEADING_CONTENT_H.min(inner.height));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(HERO_NAME_H), Constraint::Length(HERO_GAP1), Constraint::Length(HERO_CAPTION_H)])
+        .constraints([
+            Constraint::Length(HERO_NAME_H),
+            Constraint::Length(HERO_GAP1),
+            Constraint::Length(HERO_CAPTION_H),
+        ])
         .split(content);
 
     // Glyph labels skip manual letter-spacing (the 8x8 font already has
@@ -1551,17 +1756,29 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
             f.render_widget(glyph, center_v(rows[0], glyph_rows.min(rows[0].height)));
         }
         None => {
-            let spaced: String = name.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-            let name_text = if spaced.chars().count() as u16 <= content.width { spaced } else { name.to_string() };
+            let spaced: String = name
+                .chars()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let name_text = if spaced.chars().count() as u16 <= content.width {
+                spaced
+            } else {
+                name.to_string()
+            };
             f.render_widget(
-                Paragraph::new(name_text).alignment(Alignment::Center).style(name_style),
+                Paragraph::new(name_text)
+                    .alignment(Alignment::Center)
+                    .style(name_style),
                 center_v(rows[0], 1),
             );
         }
     }
 
     f.render_widget(
-        Paragraph::new(caption).alignment(Alignment::Center).style(caption_style),
+        Paragraph::new(caption)
+            .alignment(Alignment::Center)
+            .style(caption_style),
         center_v(rows[2], 1),
     );
 }
@@ -1629,7 +1846,13 @@ fn render_hero_prompt(
     let notes_inner = notes_block.inner(notes_section);
     f.render_widget(notes_block, notes_section);
     let notes_h = HERO_CHIP_H.min(notes_inner.height);
-    render_targets_row(f, center_v(notes_inner, notes_h), ui, theme, settings.fretboard_highlight);
+    render_targets_row(
+        f,
+        center_v(notes_inner, notes_h),
+        ui,
+        theme,
+        settings.fretboard_highlight,
+    );
 
     render_detected_indicator(f, detected_section, ui, theme);
 }
@@ -1638,7 +1861,12 @@ fn render_hero_prompt(
 mod detected_correctness_tests {
     use super::*;
 
-    fn ui_with(targets: &[&str], matched: &[bool], ordered: bool, detected: Option<&str>) -> UiState {
+    fn ui_with(
+        targets: &[&str],
+        matched: &[bool],
+        ordered: bool,
+        detected: Option<&str>,
+    ) -> UiState {
         UiState {
             targets: targets.iter().map(|s| s.to_string()).collect(),
             matched_indices: matched.to_vec(),
@@ -1650,7 +1878,12 @@ mod detected_correctness_tests {
 
     #[test]
     fn unordered_correct_when_any_unmatched_target_sounds() {
-        let ui = ui_with(&["A2", "B2", "C3"], &[false, true, false], false, Some("C3"));
+        let ui = ui_with(
+            &["A2", "B2", "C3"],
+            &[false, true, false],
+            false,
+            Some("C3"),
+        );
         assert_eq!(detected_correctness(&ui), Some(true));
     }
 
@@ -1719,7 +1952,13 @@ fn strip_octave(name: &str) -> &str {
 /// advances prompt to prompt. A one-line legend below the board (shown
 /// whenever there's vertical room to spare) explains the fret-marker dots
 /// and, in highlight mode, what the position colors mean.
-fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settings: &SettingsState, theme: &Theme) {
+fn render_fretboard(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let tuning = settings.resolved_tuning();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1752,12 +1991,30 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
     // picked fits `inner.width` with no leftover deficit for the `Table`
     // widget's own constraint solver to silently shrink away.
     const TIERS: [Tier; 3] = [
-        Tier { gutter_w: 5, string_col_w: 7, spacing: 2, spaced_text: true },
-        Tier { gutter_w: 5, string_col_w: 6, spacing: 1, spaced_text: true },
-        Tier { gutter_w: 4, string_col_w: 4, spacing: 1, spaced_text: false },
+        Tier {
+            gutter_w: 5,
+            string_col_w: 7,
+            spacing: 2,
+            spaced_text: true,
+        },
+        Tier {
+            gutter_w: 5,
+            string_col_w: 6,
+            spacing: 1,
+            spaced_text: true,
+        },
+        Tier {
+            gutter_w: 4,
+            string_col_w: 4,
+            spacing: 1,
+            spaced_text: false,
+        },
     ];
     let tier_width = |t: &Tier| t.gutter_w + t.string_col_w * 6 + t.spacing * 6;
-    let tier = TIERS.iter().find(|t| tier_width(t) <= inner.width).unwrap_or(&TIERS[2]);
+    let tier = TIERS
+        .iter()
+        .find(|t| tier_width(t) <= inner.width)
+        .unwrap_or(&TIERS[2]);
     let table_width = tier_width(tier).min(inner.width);
 
     // 1 header row (string letters) + as many fret rows as fit, starting
@@ -1785,7 +2042,13 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
     const GAP_PRIORITY_MARKERS: [u8; 9] = [3, 5, 7, 9, 12, 15, 17, 19, 21];
     let slack = inner.height.saturating_sub(base_h);
     let show_legend = full_board && slack >= 2;
-    let gap_budget = if full_board { slack.saturating_sub(if show_legend { 2 } else { 0 }).min(frets_total) } else { 0 };
+    let gap_budget = if full_board {
+        slack
+            .saturating_sub(if show_legend { 2 } else { 0 })
+            .min(frets_total)
+    } else {
+        0
+    };
     let gap_frets: Vec<u8> = GAP_PRIORITY_MARKERS
         .iter()
         .copied()
@@ -1794,25 +2057,41 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
         .collect();
     let content_h = base_h + gap_budget;
 
-    let block_h = if show_legend { content_h + 2 } else { content_h };
+    let block_h = if show_legend {
+        content_h + 2
+    } else {
+        content_h
+    };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Fill(1), Constraint::Length(table_width), Constraint::Fill(1)])
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(table_width),
+            Constraint::Fill(1),
+        ])
         .split(inner);
     let centered = center_v(cols[1], block_h);
     let (table_area, legend_area) = if show_legend {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(content_h), Constraint::Length(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(content_h),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(centered);
         (rows[0], Some(rows[2]))
     } else {
         (centered, None)
     };
 
-    let header_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
-    let open_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
+    let header_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let open_style = Style::default()
+        .fg(theme_color(&theme.secondary, Color::Cyan))
+        .add_modifier(Modifier::BOLD);
     let note_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
     let gutter_style = Style::default().fg(Color::DarkGray);
     let active = if settings.fretboard_highlight {
@@ -1832,16 +2111,31 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
         seen
     };
 
-    let spaced = |s: &str| -> String { s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
-    let label = |s: &str| -> String { if tier.spaced_text { spaced(s) } else { s.to_string() } };
-    let centered_cell = |text: String, style: Style| Cell::from(Line::from(text).alignment(Alignment::Center)).style(style);
+    let spaced = |s: &str| -> String {
+        s.chars()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let label = |s: &str| -> String {
+        if tier.spaced_text {
+            spaced(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let centered_cell = |text: String, style: Style| {
+        Cell::from(Line::from(text).alignment(Alignment::Center)).style(style)
+    };
 
-    let header = Row::new(std::iter::once(centered_cell("Fr".to_string(), header_style)).chain(
-        tuning.open_strings.iter().map(|&m| {
-            let name = Note::from_midi_clamped(m).name();
-            centered_cell(label(strip_octave(&name)), header_style)
-        }),
-    ));
+    let header = Row::new(
+        std::iter::once(centered_cell("Fr".to_string(), header_style)).chain(
+            tuning.open_strings.iter().map(|&m| {
+                let name = Note::from_midi_clamped(m).name();
+                centered_cell(label(strip_octave(&name)), header_style)
+            }),
+        ),
+    );
     let rows: Vec<Row> = (0..frets_shown as u8)
         .map(|fret| {
             let marker = if fret == FRET_DOUBLE_MARKER {
@@ -1854,7 +2148,10 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
             let row_style = if fret == 0 { open_style } else { note_style };
             let gutter = centered_cell(format!("{fret}{marker}"), gutter_style);
             let string_cells = (0..6usize).map(|s| {
-                let name = tuning.string_note(s, fret).map(|n| n.name()).unwrap_or_else(|| "-".to_string());
+                let name = tuning
+                    .string_note(s, fret)
+                    .map(|n| n.name())
+                    .unwrap_or_else(|| "-".to_string());
                 let cell_style = active
                     .iter()
                     .find(|(n, _)| n == &name)
@@ -1868,9 +2165,14 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
         .collect();
 
     let widths: Vec<Constraint> = std::iter::once(Constraint::Length(tier.gutter_w))
-        .chain(std::iter::repeat_n(Constraint::Length(tier.string_col_w), 6))
+        .chain(std::iter::repeat_n(
+            Constraint::Length(tier.string_col_w),
+            6,
+        ))
         .collect();
-    let table = Table::new(rows, widths).header(header).column_spacing(tier.spacing);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(tier.spacing);
     f.render_widget(table, table_area);
 
     if let Some(legend_area) = legend_area {
@@ -1881,12 +2183,18 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
                 // One swatch per still-needed position color (capped),
                 // mirroring the chip underscores.
                 for c in active_colors.iter().take(6) {
-                    spans.push(Span::styled("●", Style::default().fg(*c).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(
+                        "●",
+                        Style::default().fg(*c).add_modifier(Modifier::BOLD),
+                    ));
                     spans.push(Span::raw(" "));
                 }
                 spans.push(Span::raw("= still-needed, in order (see chips)"));
             } else if let Some((_, c)) = active.first() {
-                spans.push(Span::styled("●", Style::default().fg(*c).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    "●",
+                    Style::default().fg(*c).add_modifier(Modifier::BOLD),
+                ));
                 spans.push(Span::raw(" still-needed target"));
             }
         }
@@ -1929,7 +2237,11 @@ fn draw_practice(
             .split(area);
         let left = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(6), Constraint::Length(3)])
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(3),
+            ])
             .split(cols[0]);
         (left[0], left[1], left[2], SessionSlot::WidePanel(cols[1]))
     } else if is_short(area) {
@@ -1987,7 +2299,11 @@ fn draw_practice(
     f.render_widget(timer_block, timer_area);
     let timer_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
         .split(timer_inner);
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(gauge_color))
@@ -2033,7 +2349,7 @@ fn draw_practice(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
-                .title(" ←→ select, Enter to activate · h = hard difficulty "),
+                .title(" ←→ select, Enter to activate · h = hard difficulty · r = replay "),
         );
     f.render_widget(footer, action_area);
 
@@ -2063,7 +2379,13 @@ fn draw_practice(
     }
 }
 
-fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+fn draw_settings(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2080,12 +2402,20 @@ fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &S
     let rows = if wide {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_h), Constraint::Length(1), Constraint::Fill(1)])
+            .constraints([
+                Constraint::Length(list_h),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
             .split(inner)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_h), Constraint::Fill(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(list_h),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ])
             .split(inner)
     };
 
@@ -2120,7 +2450,13 @@ fn draw_settings(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &S
 /// currently highlighted — fills the space the old fixed-height list left
 /// blank below its last item with something the highlighted row can
 /// actually use.
-fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+fn render_settings_help(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let body = match app.settings_idx {
         0 => "How long a prompt stays on screen before it times out. Longer gives more time to \
               find every target note."
@@ -2141,18 +2477,22 @@ fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, setti
               any newly-struck wrong note resets progress to the first note of the prompt. \
               Press h during practice to flip it for the current session."
             .to_string(),
-        6..=12 => {
-            let (c, _) = &settings.enabled[app.settings_idx - 6];
+        6 => "Ear training: the computer plays each prompt's note(s) aloud once — find them on \
+              the guitar by ear before the timer runs out (a timeout counts as a miss). \
+              Press r during practice to re-sound the current note(s)."
+            .to_string(),
+        7..=13 => {
+            let (c, _) = &settings.enabled[app.settings_idx - 7];
             category_help(*c).to_string()
         }
-        13 => format!(
+        14 => format!(
             "{} input device(s) found. Press Enter to rescan and choose one.",
             app.devices.len()
         ),
-        14 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
+        15 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
               library. Leave empty to use only the built-in content."
             .to_string(),
-        15 => "Save every change above and return to where you started.".to_string(),
+        16 => "Save every change above and return to where you started.".to_string(),
         _ => String::new(),
     };
     let block = Block::default()
@@ -2200,27 +2540,41 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
             if settings.custom_tunings.is_empty() {
                 "Add custom tuning".to_string()
             } else {
-                format!("Add custom tuning ({} loaded)", settings.custom_tunings.len())
+                format!(
+                    "Add custom tuning ({} loaded)",
+                    settings.custom_tunings.len()
+                )
             }
         }
         3 => format!(
             "Fretboard highlight: {}",
-            if settings.fretboard_highlight { "ON" } else { "off" }
+            if settings.fretboard_highlight {
+                "ON"
+            } else {
+                "off"
+            }
         ),
-        4 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
+        4 => format!(
+            "Random mode: {}",
+            if settings.random_mode { "ON" } else { "off" }
+        ),
         5 => format!(
             "Hard difficulty (perfect sequence): {}",
             if settings.hard_sequence { "ON" } else { "off" }
         ),
-        6..=12 => {
-            let (c, on) = &settings.enabled[i - 6];
+        6 => format!("Ear training: {}", settings.ear_training.label()),
+        7..=13 => {
+            let (c, on) = &settings.enabled[i - 7];
             format!("[{}] {}", if *on { "✓" } else { " " }, c.label())
         }
-        13 => format!(
+        14 => format!(
             "Audio device: {}",
-            settings.audio_device.clone().unwrap_or_else(|| "(default mic)".to_string())
+            settings
+                .audio_device
+                .clone()
+                .unwrap_or_else(|| "(default mic)".to_string())
         ),
-        14 => {
+        15 => {
             if app.edit == Edit::Path {
                 format!("Custom content path: {}█", app.edit_buf)
             } else {
@@ -2232,12 +2586,18 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
                 format!("Custom content path: {p}")
             }
         }
-        15 => "← Back (save & return)".to_string(),
+        16 => "← Back (save & return)".to_string(),
         _ => String::new(),
     }
 }
 
-fn draw_device_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+fn draw_device_pick(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2283,7 +2643,14 @@ fn tuning_pick_candidates(settings: &SettingsState) -> Vec<ActiveTuning> {
     TuningId::ALL
         .iter()
         .map(|&id| ActiveTuning::Builtin(id))
-        .chain(settings.custom_tunings.iter().map(|t| ActiveTuning::Custom { name: t.name.clone() }))
+        .chain(
+            settings
+                .custom_tunings
+                .iter()
+                .map(|t| ActiveTuning::Custom {
+                    name: t.name.clone(),
+                }),
+        )
         .collect()
 }
 
@@ -2297,7 +2664,13 @@ fn tuning_pick_label(c: &ActiveTuning, settings: &SettingsState) -> String {
     }
 }
 
-fn draw_tuning_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+fn draw_tuning_pick(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2324,7 +2697,9 @@ fn draw_tuning_pick(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings:
         .constraints([Constraint::Length(list_h), Constraint::Fill(1)])
         .split(inner);
 
-    let list = List::new(items).highlight_style(selection_style(theme)).highlight_symbol("‣ ");
+    let list = List::new(items)
+        .highlight_style(selection_style(theme))
+        .highlight_symbol("‣ ");
     let mut state = ListState::default();
     state.select(Some(app.tuning_pick_idx));
     f.render_stateful_widget(list, rows[0], &mut state);
@@ -2348,7 +2723,13 @@ fn handle_tuning_pick_key(k: KeyEvent, app: &mut App, settings: &mut SettingsSta
     true
 }
 
-fn draw_custom_tuning_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, settings: &SettingsState, theme: &Theme) {
+fn draw_custom_tuning_help(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &App,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

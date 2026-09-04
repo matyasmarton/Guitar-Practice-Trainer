@@ -50,6 +50,40 @@ impl From<EnabledCategory> for ChallengeType {
     }
 }
 
+/// Listen-and-repeat ("ear training") practice mode. While active it replaces
+/// the category-based generator: the engine plays the prompt's target note(s)
+/// aloud through the speakers and the player finds them by ear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EarTrainingMode {
+    /// Normal category-based practice.
+    #[default]
+    Off,
+    /// The engine plays one note; find it on the guitar.
+    Single,
+    /// The engine plays a short run of consecutive notes; play them back in order.
+    Sequence,
+}
+
+impl EarTrainingMode {
+    /// Human-readable label (Settings row + category chips).
+    pub fn label(self) -> &'static str {
+        match self {
+            EarTrainingMode::Off => "Off",
+            EarTrainingMode::Single => "Single note",
+            EarTrainingMode::Sequence => "Consecutive notes (4)",
+        }
+    }
+
+    /// Next mode in the Settings cycling order.
+    pub fn cycle(self) -> Self {
+        match self {
+            EarTrainingMode::Off => EarTrainingMode::Single,
+            EarTrainingMode::Single => EarTrainingMode::Sequence,
+            EarTrainingMode::Sequence => EarTrainingMode::Off,
+        }
+    }
+}
+
 /// Persisted user configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -86,6 +120,9 @@ pub struct Config {
     /// during this window). `0` disables the pause.
     #[serde(default = "default_match_pause_ms")]
     pub match_pause_ms: u32,
+    /// Listen-and-repeat mode: replaces the category generator while active.
+    #[serde(default)]
+    pub ear_training: EarTrainingMode,
 }
 
 fn default_match_pause_ms() -> u32 {
@@ -105,6 +142,7 @@ impl Default for Config {
             custom_tuning_path: None,
             audio_device_name: None,
             match_pause_ms: default_match_pause_ms(),
+            ear_training: EarTrainingMode::Off,
         }
     }
 }
@@ -166,8 +204,7 @@ pub fn save_to(cfg: &Config, path: &Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(cfg).context("serializing config")?;
-    std::fs::write(path, text)
-        .with_context(|| format!("writing {}", path.display()))
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -269,9 +306,34 @@ mod tests {
     }
 
     #[test]
+    fn ear_training_defaults_off() {
+        assert_eq!(Config::default().ear_training, EarTrainingMode::Off);
+    }
+
+    #[test]
+    fn ear_training_round_trip_toml() {
+        let mut c = Config::default();
+        c.ear_training = EarTrainingMode::Sequence;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.ear_training, EarTrainingMode::Sequence);
+    }
+
+    #[test]
+    fn ear_training_label_and_cycle() {
+        assert_eq!(EarTrainingMode::Off.label(), "Off");
+        assert_eq!(EarTrainingMode::Single.label(), "Single note");
+        assert_eq!(EarTrainingMode::Sequence.label(), "Consecutive notes (4)");
+        assert_eq!(EarTrainingMode::Off.cycle(), EarTrainingMode::Single);
+        assert_eq!(EarTrainingMode::Single.cycle(), EarTrainingMode::Sequence);
+        assert_eq!(EarTrainingMode::Sequence.cycle(), EarTrainingMode::Off);
+    }
+
+    #[test]
     fn old_bare_string_tuning_still_parses() {
         // A config.toml saved before this change: `tuning = "standard"`.
-        let text = "default_duration_sec = 30\nenabled = []\nrandom_mode = false\ntuning = \"standard\"\n";
+        let text =
+            "default_duration_sec = 30\nenabled = []\nrandom_mode = false\ntuning = \"standard\"\n";
         let c: Config = toml::from_str(text).unwrap();
         assert_eq!(
             c.tuning,
@@ -282,12 +344,16 @@ mod tests {
     #[test]
     fn custom_tuning_selection_round_trips_toml() {
         let mut c = Config::default();
-        c.tuning = crate::custom_tuning::ActiveTuning::Custom { name: "Open D".to_string() };
+        c.tuning = crate::custom_tuning::ActiveTuning::Custom {
+            name: "Open D".to_string(),
+        };
         let text = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(
             back.tuning,
-            crate::custom_tuning::ActiveTuning::Custom { name: "Open D".to_string() }
+            crate::custom_tuning::ActiveTuning::Custom {
+                name: "Open D".to_string()
+            }
         );
     }
 }

@@ -20,11 +20,13 @@ use rand_chacha::ChaCha8Rng;
 use tracing::{debug, warn};
 
 use crate::audio::{AudioInput, PitchEvent};
-use crossbeam_channel::Receiver;
-use crate::challenges::{generate, Challenge, ChallengeType};
+use crate::challenges::{
+    gen_listen_sequence, gen_listen_single, generate, Challenge, ChallengeType,
+};
 use crate::config::Config;
 use crate::content::ContentLibrary;
 use crate::note::Note;
+use crossbeam_channel::Receiver;
 
 /// UI-facing challenge record (owned, no `Note` leakage — UniFFI-friendly).
 #[derive(Clone, Debug)]
@@ -34,6 +36,8 @@ pub struct ChallengeView {
     pub display: String,
     pub targets: Vec<String>,
     pub ordered: bool,
+    /// Listen-and-repeat prompt: targets sound, UI masks names until matched.
+    pub listen: bool,
 }
 
 impl ChallengeView {
@@ -43,6 +47,7 @@ impl ChallengeView {
             display: c.display.clone(),
             targets: c.target_names(),
             ordered: c.ordered,
+            listen: c.listen,
         }
     }
 }
@@ -124,6 +129,9 @@ struct EngineInner {
     /// True if any frame of the current run had the note equal to the
     /// then-required target.
     sustain_was_legal: bool,
+    /// Monotonic counter incremented on every `pick_new_prompt`; lets the
+    /// driver notice prompt advances without touching the state machine.
+    prompt_seq: u64,
 }
 
 impl EngineInner {
@@ -144,8 +152,13 @@ pub struct Engine {
     audio: Mutex<Option<AudioInput>>,
     pitch_rx: Mutex<Option<Receiver<PitchEvent>>>,
     driver: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Tone playback for ear-training mode (`None` when the mode is off or
+    /// the output device is unavailable).
+    player: Arc<Mutex<Option<crate::tones::TonePlayer>>>,
+    /// "Audio is sounding" gate: while set, the driver drops pitch events and
+    /// freezes the countdown, and `replay()` refuses to double-sound.
+    playing: Arc<AtomicBool>,
 }
-
 impl Engine {
     /// Create the engine. Loads the bundled + custom content library and the
     /// persisted config, but does **not** start audio or the tick loop.
@@ -160,25 +173,25 @@ impl Engine {
         seed: Option<u64>,
     ) -> Result<Self, anyhow::Error> {
         let library = match &config.custom_content_path {
-            Some(p) if !p.as_os_str().is_empty() => {
-                match ContentLibrary::load(p) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        warn!("custom content load failed ({e:?}); using bundled only");
-                        ContentLibrary::bundled()
-                    }
+            Some(p) if !p.as_os_str().is_empty() => match ContentLibrary::load(p) {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("custom content load failed ({e:?}); using bundled only");
+                    ContentLibrary::bundled()
                 }
-            }
+            },
             _ => ContentLibrary::bundled(),
         };
         let custom_tunings = match &config.custom_tuning_path {
-            Some(p) if !p.as_os_str().is_empty() => match crate::custom_tuning::load_custom_tunings(p) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("custom tuning load failed ({e:?}); using none");
-                    Vec::new()
+            Some(p) if !p.as_os_str().is_empty() => {
+                match crate::custom_tuning::load_custom_tunings(p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("custom tuning load failed ({e:?}); using none");
+                        Vec::new()
+                    }
                 }
-            },
+            }
             _ => Vec::new(),
         };
         let active_tuning = crate::custom_tuning::resolve_tuning(&config.tuning, &custom_tunings);
@@ -201,6 +214,7 @@ impl Engine {
                 display: String::new(),
                 targets: vec![],
                 ordered: false,
+                listen: false,
             },
             matched: vec![],
             next_idx: 0,
@@ -213,6 +227,7 @@ impl Engine {
             last_emitted_note: None,
             score_passed: 0,
             score_total: 0,
+            prompt_seq: 0,
             cooldown_remaining: Duration::ZERO,
             sustain_midi: None,
             sustain_len: 0,
@@ -228,9 +243,10 @@ impl Engine {
             audio: Mutex::new(None),
             pitch_rx: Mutex::new(None),
             driver: Mutex::new(None),
+            player: Arc::new(Mutex::new(None)),
+            playing: Arc::new(AtomicBool::new(false)),
         })
     }
-
     /// Begin practice: start audio capture + the driver loop + emit first prompt.
     pub fn start(&self) -> Result<(), anyhow::Error> {
         self.shutdown.store(false, Ordering::SeqCst);
@@ -259,14 +275,25 @@ impl Engine {
             emit_score(&self.listener, &inner);
         }
 
+        // Tone player for ear-training mode (silent fallback if unavailable).
+        if self.inner.lock().config.ear_training != crate::config::EarTrainingMode::Off {
+            match crate::tones::TonePlayer::start(Arc::clone(&self.playing)) {
+                Ok(p) => *self.player.lock() = Some(p),
+                Err(e) => warn!("tone player unavailable ({e}); ear training continues silently"),
+            }
+        }
+        maybe_autoplay(&self.inner, &self.playing, &self.player);
+
         // Driver loop.
         let inner = Arc::clone(&self.inner);
         let listener = Arc::clone(&self.listener);
         let shutdown = Arc::clone(&self.shutdown);
+        let playing = Arc::clone(&self.playing);
+        let player = Arc::clone(&self.player);
         let driver = self.pitch_rx.lock().take().unwrap();
         let handle = std::thread::Builder::new()
             .name("gtt-engine".into())
-            .spawn(move || run_driver(driver, inner, listener, shutdown))
+            .spawn(move || run_driver(driver, inner, listener, shutdown, playing, player))
             .map_err(|e| anyhow::anyhow!("spawning engine driver: {e}"))?;
         *self.driver.lock() = Some(handle);
 
@@ -278,7 +305,9 @@ impl Engine {
         self.shutdown.store(true, Ordering::SeqCst);
         // Drop audio first so the pitch stream ends.
         *self.audio.lock() = None;
-        // Draining the rx lets the driver's try_recv see no more events.
+        // Drop the tone player and clear the gate alongside teardown.
+        *self.player.lock() = None;
+        self.playing.store(false, Ordering::SeqCst);
         if let Some(h) = self.driver.lock().take() {
             let _ = h.join();
         }
@@ -293,28 +322,45 @@ impl Engine {
         inner.default_duration = Duration::from_secs(cfg.default_duration_sec.max(1) as u64);
         if content_path_changed {
             match &cfg.custom_content_path {
-                Some(p) if !p.as_os_str().is_empty() => {
-                    match ContentLibrary::load(p) {
-                        Ok(l) => inner.library = l,
-                        Err(e) => warn!("custom content reload failed: {e:?}"),
-                    }
-                }
+                Some(p) if !p.as_os_str().is_empty() => match ContentLibrary::load(p) {
+                    Ok(l) => inner.library = l,
+                    Err(e) => warn!("custom content reload failed: {e:?}"),
+                },
                 _ => inner.library = ContentLibrary::bundled(),
             }
         }
         if tuning_path_changed {
             inner.custom_tunings = match &cfg.custom_tuning_path {
-                Some(p) if !p.as_os_str().is_empty() => match crate::custom_tuning::load_custom_tunings(p) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("custom tuning reload failed: {e:?}");
-                        Vec::new()
+                Some(p) if !p.as_os_str().is_empty() => {
+                    match crate::custom_tuning::load_custom_tunings(p) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("custom tuning reload failed: {e:?}");
+                            Vec::new()
+                        }
                     }
-                },
+                }
                 _ => Vec::new(),
             };
         }
-        inner.active_tuning = crate::custom_tuning::resolve_tuning(&cfg.tuning, &inner.custom_tunings);
+        inner.active_tuning =
+            crate::custom_tuning::resolve_tuning(&cfg.tuning, &inner.custom_tunings);
+        drop(inner);
+        // Ear-training toggle takes effect on the next prompt: create or drop
+        // the tone player to match the new mode (only while practicing).
+        if self.driver.lock().is_some() {
+            let ear_on = cfg.ear_training != crate::config::EarTrainingMode::Off;
+            if ear_on && self.player.lock().is_none() {
+                match crate::tones::TonePlayer::start(Arc::clone(&self.playing)) {
+                    Ok(p) => *self.player.lock() = Some(p),
+                    Err(e) => {
+                        warn!("tone player unavailable ({e}); ear training continues silently")
+                    }
+                }
+            } else if !ear_on {
+                *self.player.lock() = None;
+            }
+        }
     }
 
     /// Snapshot of the loaded custom tunings (for UI display, e.g. the
@@ -337,6 +383,54 @@ impl Engine {
         reset_timer(&mut inner);
         emit_prompt(&self.listener, &inner);
         emit_score(&self.listener, &inner);
+        drop(inner);
+        maybe_autoplay(&self.inner, &self.playing, &self.player);
+    }
+
+    /// Re-sound the still-needed note(s) of the current ear-training prompt.
+    /// No-op when the mode is off or audio is already sounding; never re-sounds
+    /// matched notes and never resets the countdown (a re-hear inside the
+    /// current window, unlike auto-play which precedes a fresh window).
+    pub fn replay(&self) {
+        let midis = {
+            let inner = self.inner.lock();
+            if inner.config.ear_training == crate::config::EarTrainingMode::Off
+                || inner.current.targets.is_empty()
+            {
+                return;
+            }
+            if inner.current.ordered {
+                let from = inner.next_idx.min(inner.current.targets.len());
+                inner.current.targets[from..]
+                    .iter()
+                    .map(|n| n.midi())
+                    .collect()
+            } else {
+                // Unordered (single-note): re-sound the first still-needed note.
+                match inner
+                    .current
+                    .targets
+                    .iter()
+                    .zip(&inner.matched)
+                    .find(|(_, m)| !**m)
+                {
+                    Some((n, _)) => vec![n.midi()],
+                    None => return,
+                }
+            }
+        };
+        if self.playing.swap(true, Ordering::SeqCst) {
+            return; // already sounding: never double-sound
+        }
+        match self.player.lock().as_ref() {
+            None => self.playing.store(false, Ordering::SeqCst),
+            Some(p) => p.play(midis),
+        }
+    }
+
+    /// True while tone audio is sounding (the TUI polls this per frame).
+    pub fn sounding(&self) -> bool {
+        self.playing.load(Ordering::SeqCst)
     }
 
     /// Configuration snapshot (for UI display).
@@ -391,10 +485,26 @@ fn run_driver(
     inner: Arc<Mutex<EngineInner>>,
     listener: Arc<dyn EngineListener>,
     shutdown: Arc<AtomicBool>,
+    playing: Arc<AtomicBool>,
+    player: Arc<Mutex<Option<crate::tones::TonePlayer>>>,
 ) {
     let tick = Duration::from_millis(10);
+    // The first prompt is played by `start()`, so pin the baseline here to
+    // avoid double-sounding it.
+    let mut last_seq = inner.lock().prompt_seq;
     while !shutdown.load(Ordering::SeqCst) {
         let start = std::time::Instant::now();
+
+        if playing.load(Ordering::SeqCst) {
+            // Audio is sounding: discard mic input (speaker bleed) and freeze
+            // the countdown and the post-match cooldown.
+            while rx.try_recv().is_ok() {}
+            let elapsed = start.elapsed();
+            if elapsed < tick {
+                std::thread::sleep(tick - elapsed);
+            }
+            continue;
+        }
 
         // Drain any pitch events.
         while let Ok(ev) = rx.try_recv() {
@@ -416,6 +526,13 @@ fn run_driver(
             handle_tick(&mut g, &listener, &cats, tick);
         }
 
+        // Auto-play newly advanced prompts (ear-training mode).
+        let seq = inner.lock().prompt_seq;
+        if seq != last_seq {
+            last_seq = seq;
+            maybe_autoplay(&inner, &playing, &player);
+        }
+
         let elapsed = start.elapsed();
         if elapsed < tick {
             std::thread::sleep(tick - elapsed);
@@ -424,15 +541,54 @@ fn run_driver(
     debug!("engine driver stopped");
 }
 
+/// Sound the current ear-training prompt's targets, if due. Never holds the
+/// inner lock across the send; never double-sounds while the gate is set.
+fn maybe_autoplay(
+    inner: &Arc<Mutex<EngineInner>>,
+    playing: &Arc<AtomicBool>,
+    player: &Arc<Mutex<Option<crate::tones::TonePlayer>>>,
+) {
+    let midis = {
+        let g = inner.lock();
+        if g.config.ear_training == crate::config::EarTrainingMode::Off {
+            return;
+        }
+        g.current
+            .targets
+            .iter()
+            .map(|n| n.midi())
+            .collect::<Vec<u8>>()
+    };
+    if midis.is_empty() || playing.swap(true, Ordering::SeqCst) {
+        return; // nothing to play, or already sounding
+    }
+    match player.lock().as_ref() {
+        None => playing.store(false, Ordering::SeqCst),
+        Some(p) => p.play(midis),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core logic (pure, testable)
 // ---------------------------------------------------------------------------
-fn pick_new_prompt(inner: &mut EngineInner, cats: &[ChallengeType], tuning: &crate::tuning::Tuning) {
-    if cats.is_empty() {
-        return;
-    }
-    let kind = cats[inner.rng.gen_range(0..cats.len())];
-    let challenge = generate(kind, &mut inner.rng, &inner.library, tuning);
+fn pick_new_prompt(
+    inner: &mut EngineInner,
+    cats: &[ChallengeType],
+    tuning: &crate::tuning::Tuning,
+) {
+    // Ear training replaces the category generator while active.
+    let challenge = match inner.config.ear_training {
+        crate::config::EarTrainingMode::Off => {
+            if cats.is_empty() {
+                return;
+            }
+            let kind = cats[inner.rng.gen_range(0..cats.len())];
+            generate(kind, &mut inner.rng, &inner.library, tuning)
+        }
+        crate::config::EarTrainingMode::Single => gen_listen_single(&mut inner.rng, tuning),
+        crate::config::EarTrainingMode::Sequence => gen_listen_sequence(&mut inner.rng, tuning),
+    };
+    inner.prompt_seq = inner.prompt_seq.wrapping_add(1);
     inner.current = challenge;
     inner.matched = vec![false; inner.current.targets.len()];
     inner.next_idx = 0;
@@ -579,19 +735,15 @@ fn accept_match(
         i
     } else {
         let detected = inner.last_detected_midi;
-        let i = inner
-            .matched
-            .iter()
-            .position(|m| !m)
-            .and_then(|i| {
-                detected.and_then(|d| {
-                    if inner.current.targets[i].midi() == d {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-            });
+        let i = inner.matched.iter().position(|m| !m).and_then(|i| {
+            detected.and_then(|d| {
+                if inner.current.targets[i].midi() == d {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+        });
         match i {
             Some(i) => {
                 inner.matched[i] = true;
@@ -619,7 +771,12 @@ fn accept_match(
         let pause_ms = inner.config.match_pause_ms;
         if pause_ms > 0 {
             inner.cooldown_remaining = Duration::from_millis(pause_ms as u64);
-            emit(listener, EngineEvent::Cooldown { duration_ms: pause_ms as u64 });
+            emit(
+                listener,
+                EngineEvent::Cooldown {
+                    duration_ms: pause_ms as u64,
+                },
+            );
         } else {
             let tuning = inner.active_tuning.clone();
             pick_new_prompt(inner, cats, &tuning);
@@ -672,7 +829,10 @@ fn emit(listener: &Arc<dyn EngineListener>, ev: EngineEvent) {
 }
 
 fn emit_prompt(listener: &Arc<dyn EngineListener>, inner: &EngineInner) {
-    emit(listener, EngineEvent::Prompt(ChallengeView::from(&inner.current)));
+    emit(
+        listener,
+        EngineEvent::Prompt(ChallengeView::from(&inner.current)),
+    );
 }
 
 fn emit_score(listener: &Arc<dyn EngineListener>, inner: &EngineInner) {
@@ -700,7 +860,6 @@ mod tests {
 
     /// A listener that records all events in order.
     type Evs = Arc<StdMutex<Vec<EngineEvent>>>;
-    /// A listener that records all events in order.
     struct Recorder {
         events: Evs,
     }
@@ -720,12 +879,7 @@ mod tests {
     }
 
     fn make_engine(rec: &Arc<Recorder>, config: Config) -> Engine {
-        Engine::new_with_rng_seed(
-            config,
-            Box::new(ListenerShim(Arc::clone(rec))),
-            Some(7),
-        )
-        .unwrap()
+        Engine::new_with_rng_seed(config, Box::new(ListenerShim(Arc::clone(rec))), Some(7)).unwrap()
     }
 
     // Bridge an Arc<Recorder> into a Box<dyn EngineListener> for Engine::new.
@@ -779,8 +933,8 @@ mod tests {
         eng.on_pitch(Some(target_hz));
         eng.on_pitch(Some(target_hz));
         eng.on_tick(Duration::from_millis(3000)); // exhaust the default match_pause_ms cooldown
-        // In-hand: the note prompt is unordered with one target; one accept → Passed.
-        // Note: Note challenges may sometimes be ordered? They are `ordered=false`.
+                                                  // In-hand: the note prompt is unordered with one target; one accept → Passed.
+                                                  // Note: Note challenges may sometimes be ordered? They are `ordered=false`.
         let got = collect(&evs);
         assert!(
             got.iter().any(|e| matches!(e, EngineEvent::Matched { .. })),
@@ -856,8 +1010,7 @@ mod tests {
     fn ordered_scale_requires_in_order_matching() {
         let (rec, evs) = Recorder::new();
         let mut cfg = Config::default();
-        cfg.enabled =
-            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.enabled = enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
         let eng = make_engine(&rec, cfg);
         // Force a Scale prompt by trying until current is a scale. With only Scale
         // enabled, pick_new_prompt always yields a Scale.
@@ -877,7 +1030,10 @@ mod tests {
             pick_new_prompt(&mut g, &cats, &tuning);
         }
         let targets = eng.inner.lock().current.targets.clone();
-        assert!(targets.len() >= 2, "need ≥2 scale targets for ordering test");
+        assert!(
+            targets.len() >= 2,
+            "need ≥2 scale targets for ordering test"
+        );
 
         let second_hz = targets[1].hz();
         eng.on_pitch(Some(second_hz));
@@ -925,12 +1081,18 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, EngineEvent::Cooldown { duration_ms: 500 }))
             .count();
-        assert_eq!(cooldown_count, 1, "expected exactly one Cooldown{{500}}: {got:?}");
+        assert_eq!(
+            cooldown_count, 1,
+            "expected exactly one Cooldown{{500}}: {got:?}"
+        );
         let prompt_count = got
             .iter()
             .filter(|e| matches!(e, EngineEvent::Prompt(_)))
             .count();
-        assert_eq!(prompt_count, 1, "no second Prompt should appear yet: {got:?}");
+        assert_eq!(
+            prompt_count, 1,
+            "no second Prompt should appear yet: {got:?}"
+        );
 
         // Mic input during the freeze must be a no-op (no additional Matched/Score).
         let (matched_before, score_before) = {
@@ -942,8 +1104,14 @@ mod tests {
             let g = eng.inner.lock();
             (g.matched_count, g.score_passed)
         };
-        assert_eq!(matched_before, matched_after, "matched_count changed during cooldown");
-        assert_eq!(score_before, score_after, "score_passed changed during cooldown");
+        assert_eq!(
+            matched_before, matched_after,
+            "matched_count changed during cooldown"
+        );
+        assert_eq!(
+            score_before, score_after,
+            "score_passed changed during cooldown"
+        );
 
         eng.on_tick(Duration::from_millis(500));
         let got = collect(&evs);
@@ -951,7 +1119,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, EngineEvent::Prompt(_)))
             .count();
-        assert_eq!(prompt_count, 2, "expected a second Prompt after cooldown expiry: {got:?}");
+        assert_eq!(
+            prompt_count, 2,
+            "expected a second Prompt after cooldown expiry: {got:?}"
+        );
     }
 
     // -- Hard difficulty (perfect sequence) --------------------------------
@@ -1002,8 +1173,7 @@ mod tests {
     fn hard_off_wrong_note_keeps_progress() {
         let (rec, evs) = Recorder::new();
         let mut cfg = Config::default();
-        cfg.enabled =
-            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.enabled = enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
         let eng = make_engine(&rec, cfg);
         emit_prompt_once(&eng);
         ensure_scale_targets(&eng, 3);
@@ -1034,8 +1204,7 @@ mod tests {
     fn hard_on_jump_ahead_resets_to_first_note() {
         let (rec, evs) = Recorder::new();
         let mut cfg = Config::default();
-        cfg.enabled =
-            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.enabled = enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
         cfg.hard_sequence = true;
         let eng = make_engine(&rec, cfg);
         emit_prompt_once(&eng);
@@ -1069,8 +1238,7 @@ mod tests {
     fn hard_on_ring_out_after_match_is_not_mistake() {
         let (rec, evs) = Recorder::new();
         let mut cfg = Config::default();
-        cfg.enabled =
-            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.enabled = enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
         cfg.hard_sequence = true;
         let eng = make_engine(&rec, cfg);
         emit_prompt_once(&eng);
@@ -1098,8 +1266,7 @@ mod tests {
     fn hard_on_replay_after_silence_resets() {
         let (rec, evs) = Recorder::new();
         let mut cfg = Config::default();
-        cfg.enabled =
-            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.enabled = enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
         cfg.hard_sequence = true;
         let eng = make_engine(&rec, cfg);
         emit_prompt_once(&eng);
@@ -1147,5 +1314,68 @@ mod tests {
         let g = eng.inner.lock();
         assert_eq!(g.next_idx, 0);
         assert_eq!(g.matched_count, 0);
+    }
+
+    #[test]
+    fn ear_single_generates_listen_prompt() {
+        let (rec, _evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.ear_training = crate::config::EarTrainingMode::Single;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        let g = eng.inner.lock();
+        assert!(g.current.listen);
+        assert!(!g.current.ordered);
+        assert_eq!(g.current.targets.len(), 1);
+        assert_eq!(g.current.display, "Play what you hear");
+        assert!(!eng.sounding(), "headless engine is player-less");
+    }
+
+    #[test]
+    fn ear_sequence_generates_ordered_run() {
+        let (rec, _evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.ear_training = crate::config::EarTrainingMode::Sequence;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        let g = eng.inner.lock();
+        assert!(g.current.listen);
+        assert!(g.current.ordered);
+        assert_eq!(g.current.targets.len(), crate::challenges::EAR_SEQ_LEN);
+        assert_eq!(g.current.display, "Play what you hear (4 notes)");
+        let midis: Vec<u8> = g.current.targets.iter().map(|n| n.midi()).collect();
+        for w in midis.windows(2) {
+            assert_ne!(w[0], w[1], "no adjacent duplicates: {midis:?}");
+        }
+    }
+
+    #[test]
+    fn replay_is_silent_noop_without_player() {
+        let (rec, evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.ear_training = crate::config::EarTrainingMode::Single;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        let before = evs.lock().unwrap().len();
+        eng.replay();
+        assert!(!eng.sounding(), "no player → gate stays clear");
+        assert_eq!(evs.lock().unwrap().len(), before, "replay emits nothing");
+        // Off mode is likewise a silent no-op.
+        let mut cfg = Config::default();
+        let eng2 = make_engine(&rec, cfg);
+        emit_prompt_once(&eng2);
+        eng2.replay();
+        assert!(!eng2.sounding());
+    }
+
+    #[test]
+    fn prompt_seq_advances_per_prompt() {
+        let (rec, _evs) = Recorder::new();
+        let cfg = Config::default();
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        let first = eng.inner.lock().prompt_seq;
+        emit_prompt_once(&eng);
+        assert_eq!(eng.inner.lock().prompt_seq, first + 1);
     }
 }

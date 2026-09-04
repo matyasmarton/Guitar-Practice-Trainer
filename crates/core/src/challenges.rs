@@ -12,9 +12,7 @@
 use rand::Rng;
 
 use crate::content::ContentLibrary;
-use crate::music::{
-    note_names, fret_notes, fret_voicing, ChordQuality, Mode, ScaleType,
-};
+use crate::music::{fret_notes, fret_voicing, note_names, ChordQuality, Mode, ScaleType};
 use crate::note::Note;
 use crate::pieces::midi_of;
 use crate::progressions::{degree_label, PROGRESSIONS};
@@ -67,6 +65,9 @@ pub struct Challenge {
     pub targets: Vec<Note>,
     /// Set-completion vs. ordered-sequence evaluation.
     pub ordered: bool,
+    /// Listen-and-repeat prompt: the engine sounds the targets and the UI
+    /// masks note names until matched. Always `false` for category generators.
+    pub listen: bool,
 }
 
 impl Challenge {
@@ -106,6 +107,7 @@ fn gen_note<R: Rng>(rng: &mut R, tuning: &Tuning) -> Challenge {
         display: note.name(),
         targets: vec![note],
         ordered: false,
+        listen: false,
     }
 }
 
@@ -123,17 +125,13 @@ fn gen_chord<R: Rng>(rng: &mut R, tuning: &Tuning) -> Challenge {
         .map(Note::from_midi_clamped)
         .collect();
     let root_name = Note::from_midi_clamped(root_midi).name();
-    let display = format!(
-        "{}{}  ({})",
-        root_name,
-        q.suffix(),
-        note_names(&voicing)
-    );
+    let display = format!("{}{}  ({})", root_name, q.suffix(), note_names(&voicing));
     Challenge {
         kind: ChallengeType::Chord,
         display,
         targets,
         ordered: false,
+        listen: false,
     }
 }
 
@@ -149,6 +147,7 @@ fn gen_scale<R: Rng>(rng: &mut R, tuning: &Tuning) -> Challenge {
         display,
         targets,
         ordered: true,
+        listen: false,
     }
 }
 
@@ -164,6 +163,7 @@ fn gen_mode<R: Rng>(rng: &mut R, tuning: &Tuning) -> Challenge {
         display,
         targets,
         ordered: true,
+        listen: false,
     }
 }
 
@@ -190,6 +190,7 @@ fn gen_progression<R: Rng>(rng: &mut R, tuning: &Tuning) -> Challenge {
         display,
         targets,
         ordered: true,
+        listen: false,
     }
 }
 
@@ -200,17 +201,14 @@ fn gen_lick<R: Rng>(rng: &mut R, tuning: &Tuning, library: &ContentLibrary) -> C
     let lick = &library.licks[rng.gen_range(0..library.licks.len())];
     let (_root_midi, notes) = transpose_intervals(tuning, &lick.intervals);
     let targets: Vec<Note> = notes.iter().copied().map(Note::from_midi_clamped).collect();
-    let head: Vec<String> = targets
-        .iter()
-        .take(4)
-        .map(|n| n.name())
-        .collect();
+    let head: Vec<String> = targets.iter().take(4).map(|n| n.name()).collect();
     let display = format!("{}  ({})", lick.name, head.join(" "));
     Challenge {
         kind: ChallengeType::Lick,
         display,
         targets,
         ordered: true,
+        listen: false,
     }
 }
 
@@ -222,7 +220,11 @@ fn gen_piece<R: Rng>(rng: &mut R, tuning: &Tuning, library: &ContentLibrary) -> 
     // Resolve literal pitches then shift by whole octaves so every note
     // sits inside the active tuning's playable range (every value in that
     // range is reachable on some string — see `TuningId::range`'s doc).
-    let raw: Vec<u8> = piece.notes.iter().map(|&(pc, oct)| midi_of(pc, oct)).collect();
+    let raw: Vec<u8> = piece
+        .notes
+        .iter()
+        .map(|&(pc, oct)| midi_of(pc, oct))
+        .collect();
     let range = tuning.range();
     let floor = *range.start() as i32;
     let ceil = *range.end() as i32;
@@ -247,6 +249,51 @@ fn gen_piece<R: Rng>(rng: &mut R, tuning: &Tuning, library: &ContentLibrary) -> 
         display,
         targets,
         ordered: true,
+        listen: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Listen-and-repeat (ear training) generators
+// ---------------------------------------------------------------------------
+
+/// Fixed v1 sequence length for `EarTrainingMode::Sequence`.
+pub const EAR_SEQ_LEN: usize = 4;
+
+/// One random note; the engine plays it and the player finds it by ear.
+pub fn gen_listen_single<R: Rng>(rng: &mut R, tuning: &Tuning) -> Challenge {
+    let midi = rng.gen_range(tuning.range());
+    let note = Note::from_midi(midi).expect("tuning.range() is within MIDI_MIN..=MIDI_MAX");
+    Challenge {
+        kind: ChallengeType::Note,
+        display: "Play what you hear".to_string(),
+        targets: vec![note],
+        ordered: false,
+        listen: true,
+    }
+}
+
+/// `EAR_SEQ_LEN` random notes, played back in order. Adjacent duplicates are
+/// re-drawn so ordered matching never straddles one sustained pitch.
+pub fn gen_listen_sequence<R: Rng>(rng: &mut R, tuning: &Tuning) -> Challenge {
+    let mut midis: Vec<u8> = Vec::with_capacity(EAR_SEQ_LEN);
+    while midis.len() < EAR_SEQ_LEN {
+        let midi = rng.gen_range(tuning.range());
+        if midis.last() == Some(&midi) {
+            continue;
+        }
+        midis.push(midi);
+    }
+    let targets = midis
+        .into_iter()
+        .map(|m| Note::from_midi(m).expect("tuning.range() is within MIDI_MIN..=MIDI_MAX"))
+        .collect();
+    Challenge {
+        kind: ChallengeType::Note,
+        display: format!("Play what you hear ({EAR_SEQ_LEN} notes)"),
+        targets,
+        ordered: true,
+        listen: true,
     }
 }
 
@@ -313,6 +360,40 @@ mod tests {
         assert_eq!(c.targets.len(), 1);
         assert!((MIDI_MIN..=MIDI_MAX).contains(&c.targets[0].midi()));
         assert!(!c.ordered);
+    }
+
+    #[test]
+    fn listen_single_shape() {
+        let c = gen_listen_single(&mut rng(), &Tuning::builtin(TuningId::AllFourths));
+        assert_eq!(c.targets.len(), 1);
+        assert!(!c.ordered);
+        assert!(c.listen);
+        assert_eq!(c.display, "Play what you hear");
+        assert_eq!(c.kind, ChallengeType::Note);
+        assert!((MIDI_MIN..=MIDI_MAX).contains(&c.targets[0].midi()));
+    }
+
+    #[test]
+    fn listen_sequence_shape() {
+        let mut r = rng();
+        for _ in 0..20 {
+            let c = gen_listen_sequence(&mut r, &Tuning::builtin(TuningId::AllFourths));
+            assert_eq!(c.targets.len(), EAR_SEQ_LEN);
+            assert!(c.ordered);
+            assert!(c.listen);
+            assert_eq!(c.display, "Play what you hear (4 notes)");
+            let midis: Vec<u8> = c.targets.iter().map(|n| n.midi()).collect();
+            for w in midis.windows(2) {
+                assert_ne!(w[0], w[1], "adjacent duplicates: {midis:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn category_generators_are_not_listen() {
+        assert!(!gen_note(&mut rng(), &Tuning::builtin(TuningId::AllFourths)).listen);
+        assert!(!gen_chord(&mut rng(), &Tuning::builtin(TuningId::AllFourths)).listen);
+        assert!(!gen_scale(&mut rng(), &Tuning::builtin(TuningId::AllFourths)).listen);
     }
 
     #[test]
@@ -412,7 +493,8 @@ mod tests {
         let l = lib();
         let reachable = |tuning: TuningId, midi: u8| {
             (0..6).any(|s| {
-                string_midi(tuning, s, 0).map_or(false, |open| midi >= open && midi - open <= FRET_COUNT)
+                string_midi(tuning, s, 0)
+                    .map_or(false, |open| midi >= open && midi - open <= FRET_COUNT)
             })
         };
         for tuning in TuningId::ALL {

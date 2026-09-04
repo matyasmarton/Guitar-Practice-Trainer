@@ -82,8 +82,14 @@ impl From<&Config> for FfiConfig {
             enabled,
             random_mode: c.random_mode,
             hard_sequence: c.hard_sequence,
-            custom_content_path: c.custom_content_path.as_ref().map(|p| p.display().to_string()),
-            custom_tuning_path: c.custom_tuning_path.as_ref().map(|p| p.display().to_string()),
+            custom_content_path: c
+                .custom_content_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            custom_tuning_path: c
+                .custom_tuning_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
             audio_device_name: c.audio_device_name.clone(),
             tuning: match &c.tuning {
                 crate::custom_tuning::ActiveTuning::Builtin(id) => id.label().to_string(),
@@ -126,12 +132,16 @@ impl FfiConfig {
                 .iter()
                 .find(|t| t.label() == self.tuning)
                 .map(|&id| crate::custom_tuning::ActiveTuning::Builtin(id))
-                .unwrap_or_else(|| crate::custom_tuning::ActiveTuning::Custom { name: self.tuning.clone() }),
+                .unwrap_or_else(|| crate::custom_tuning::ActiveTuning::Custom {
+                    name: self.tuning.clone(),
+                }),
             match_pause_ms: self.match_pause_ms,
             // Not currently exposed over the FFI surface (TUI-only setting;
             // Android has no fretboard visualizer to highlight).
             fretboard_highlight: false,
             hard_sequence: self.hard_sequence,
+            // TUI-only in v1: Android runs with ear training permanently off.
+            ear_training: crate::config::EarTrainingMode::Off,
         }
     }
 }
@@ -142,7 +152,9 @@ pub fn create_engine(
     config: FfiConfig,
     listener: Box<dyn EngineListener>,
 ) -> Result<Arc<Engine>, FfiError> {
-    Engine::new(config.to_config(), listener).map(Arc::new).map_err(Into::into)
+    Engine::new(config.to_config(), listener)
+        .map(Arc::new)
+        .map_err(Into::into)
 }
 
 /// Load the persisted config (or defaults) without constructing an Engine.

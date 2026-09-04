@@ -17,20 +17,20 @@ package dev.guitartrainer
 // compile the Rust component. The easiest way to ensure this is to bundle the Kotlin
 // helpers directly inline like we're doing here.
 
-import com.sun.jna.Library
+import com.sun.jna.Callback
 import com.sun.jna.IntegerType
+import com.sun.jna.Library
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
-import com.sun.jna.Callback
 import com.sun.jna.ptr.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
 // A rust-owned buffer is represented by its capacity, its current length, and a
@@ -44,29 +44,41 @@ open class RustBuffer : Structure() {
     // Note: `capacity` and `len` are actually `ULong` values, but JVM only supports signed values.
     // When dealing with these fields, make sure to call `toULong()`.
     @JvmField var capacity: Long = 0
+
     @JvmField var len: Long = 0
+
     @JvmField var data: Pointer? = null
 
-    class ByValue: RustBuffer(), Structure.ByValue
-    class ByReference: RustBuffer(), Structure.ByReference
+    class ByValue :
+        RustBuffer(),
+        Structure.ByValue
 
-   internal fun setValue(other: RustBuffer) {
+    class ByReference :
+        RustBuffer(),
+        Structure.ByReference
+
+    internal fun setValue(other: RustBuffer) {
         capacity = other.capacity
         len = other.len
         data = other.data
     }
 
     companion object {
-        internal fun alloc(size: ULong = 0UL) = uniffiRustCall() { status ->
-            // Note: need to convert the size to a `Long` value to make this work with JVM.
-            UniffiLib.INSTANCE.ffi_guitar_trainer_core_rustbuffer_alloc(size.toLong(), status)
-        }.also {
-            if(it.data == null) {
-               throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=${size})")
-           }
-        }
+        internal fun alloc(size: ULong = 0UL) =
+            uniffiRustCall { status ->
+                // Note: need to convert the size to a `Long` value to make this work with JVM.
+                UniffiLib.INSTANCE.ffi_guitar_trainer_core_rustbuffer_alloc(size.toLong(), status)
+            }.also {
+                if (it.data == null) {
+                    throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=$size)")
+                }
+            }
 
-        internal fun create(capacity: ULong, len: ULong, data: Pointer?): RustBuffer.ByValue {
+        internal fun create(
+            capacity: ULong,
+            len: ULong,
+            data: Pointer?,
+        ): RustBuffer.ByValue {
             var buf = RustBuffer.ByValue()
             buf.capacity = capacity.toLong()
             buf.len = len.toLong()
@@ -74,9 +86,10 @@ open class RustBuffer : Structure() {
             return buf
         }
 
-        internal fun free(buf: RustBuffer.ByValue) = uniffiRustCall() { status ->
-            UniffiLib.INSTANCE.ffi_guitar_trainer_core_rustbuffer_free(buf, status)
-        }
+        internal fun free(buf: RustBuffer.ByValue) =
+            uniffiRustCall { status ->
+                UniffiLib.INSTANCE.ffi_guitar_trainer_core_rustbuffer_free(buf, status)
+            }
     }
 
     @Suppress("TooGenericExceptionThrown")
@@ -129,10 +142,14 @@ class RustBufferByReference : ByReference(16) {
 @Structure.FieldOrder("len", "data")
 internal open class ForeignBytes : Structure() {
     @JvmField var len: Int = 0
+
     @JvmField var data: Pointer? = null
 
-    class ByValue : ForeignBytes(), Structure.ByValue
+    class ByValue :
+        ForeignBytes(),
+        Structure.ByValue
 }
+
 /**
  * The FfiConverter interface handles converter types to and from the FFI
  *
@@ -162,7 +179,10 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun allocationSize(value: KotlinType): ULong
 
     // Write a Kotlin type to a `ByteBuffer`
-    fun write(value: KotlinType, buf: ByteBuffer)
+    fun write(
+        value: KotlinType,
+        buf: ByteBuffer,
+    )
 
     // Lower a value into a `RustBuffer`
     //
@@ -173,9 +193,10 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun lowerIntoRustBuffer(value: KotlinType): RustBuffer.ByValue {
         val rbuf = RustBuffer.alloc(allocationSize(value))
         try {
-            val bbuf = rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
-                it.order(ByteOrder.BIG_ENDIAN)
-            }
+            val bbuf =
+                rbuf.data!!.getByteBuffer(0, rbuf.capacity).also {
+                    it.order(ByteOrder.BIG_ENDIAN)
+                }
             write(value, bbuf)
             rbuf.writeField("len", bbuf.position().toLong())
             return rbuf
@@ -192,11 +213,11 @@ public interface FfiConverter<KotlinType, FfiType> {
     fun liftFromRustBuffer(rbuf: RustBuffer.ByValue): KotlinType {
         val byteBuf = rbuf.asByteBuffer()!!
         try {
-           val item = read(byteBuf)
-           if (byteBuf.hasRemaining()) {
-               throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
-           }
-           return item
+            val item = read(byteBuf)
+            if (byteBuf.hasRemaining()) {
+                throw RuntimeException("junk remaining in buffer after lifting, something is very wrong!!")
+            }
+            return item
         } finally {
             RustBuffer.free(rbuf)
         }
@@ -208,8 +229,9 @@ public interface FfiConverter<KotlinType, FfiType> {
  *
  * @suppress
  */
-public interface FfiConverterRustBuffer<KotlinType>: FfiConverter<KotlinType, RustBuffer.ByValue> {
+public interface FfiConverterRustBuffer<KotlinType> : FfiConverter<KotlinType, RustBuffer.ByValue> {
     override fun lift(value: RustBuffer.ByValue) = liftFromRustBuffer(value)
+
     override fun lower(value: KotlinType) = lowerIntoRustBuffer(value)
 }
 // A handful of classes and functions to support the generated data structures.
@@ -222,24 +244,24 @@ internal const val UNIFFI_CALL_UNEXPECTED_ERROR = 2.toByte()
 @Structure.FieldOrder("code", "error_buf")
 internal open class UniffiRustCallStatus : Structure() {
     @JvmField var code: Byte = 0
+
     @JvmField var error_buf: RustBuffer.ByValue = RustBuffer.ByValue()
 
-    class ByValue: UniffiRustCallStatus(), Structure.ByValue
+    class ByValue :
+        UniffiRustCallStatus(),
+        Structure.ByValue
 
-    fun isSuccess(): Boolean {
-        return code == UNIFFI_CALL_SUCCESS
-    }
+    fun isSuccess(): Boolean = code == UNIFFI_CALL_SUCCESS
 
-    fun isError(): Boolean {
-        return code == UNIFFI_CALL_ERROR
-    }
+    fun isError(): Boolean = code == UNIFFI_CALL_ERROR
 
-    fun isPanic(): Boolean {
-        return code == UNIFFI_CALL_UNEXPECTED_ERROR
-    }
+    fun isPanic(): Boolean = code == UNIFFI_CALL_UNEXPECTED_ERROR
 
     companion object {
-        fun create(code: Byte, errorBuf: RustBuffer.ByValue): UniffiRustCallStatus.ByValue {
+        fun create(
+            code: Byte,
+            errorBuf: RustBuffer.ByValue,
+        ): UniffiRustCallStatus.ByValue {
             val callStatus = UniffiRustCallStatus.ByValue()
             callStatus.code = code
             callStatus.error_buf = errorBuf
@@ -248,7 +270,9 @@ internal open class UniffiRustCallStatus : Structure() {
     }
 }
 
-class InternalException(message: String) : kotlin.Exception(message)
+class InternalException(
+    message: String,
+) : kotlin.Exception(message)
 
 /**
  * Each top-level error class has a companion object that can lift the error from the call status's rust buffer
@@ -256,7 +280,7 @@ class InternalException(message: String) : kotlin.Exception(message)
  * @suppress
  */
 interface UniffiRustCallStatusErrorHandler<E> {
-    fun lift(error_buf: RustBuffer.ByValue): E;
+    fun lift(error_buf: RustBuffer.ByValue): E
 }
 
 // Helpers for calling Rust
@@ -264,7 +288,10 @@ interface UniffiRustCallStatusErrorHandler<E> {
 // synchronize itself
 
 // Call a rust function that returns a Result<>.  Pass in the Error class companion that corresponds to the Err
-private inline fun <U, E: kotlin.Exception> uniffiRustCallWithError(errorHandler: UniffiRustCallStatusErrorHandler<E>, callback: (UniffiRustCallStatus) -> U): U {
+private inline fun <U, E : kotlin.Exception> uniffiRustCallWithError(
+    errorHandler: UniffiRustCallStatusErrorHandler<E>,
+    callback: (UniffiRustCallStatus) -> U,
+): U {
     var status = UniffiRustCallStatus()
     val return_value = callback(status)
     uniffiCheckCallStatus(errorHandler, status)
@@ -272,7 +299,10 @@ private inline fun <U, E: kotlin.Exception> uniffiRustCallWithError(errorHandler
 }
 
 // Check UniffiRustCallStatus and throw an error if the call wasn't successful
-private fun<E: kotlin.Exception> uniffiCheckCallStatus(errorHandler: UniffiRustCallStatusErrorHandler<E>, status: UniffiRustCallStatus) {
+private fun <E : kotlin.Exception> uniffiCheckCallStatus(
+    errorHandler: UniffiRustCallStatusErrorHandler<E>,
+    status: UniffiRustCallStatus,
+) {
     if (status.isSuccess()) {
         return
     } else if (status.isError()) {
@@ -296,7 +326,7 @@ private fun<E: kotlin.Exception> uniffiCheckCallStatus(errorHandler: UniffiRustC
  *
  * @suppress
  */
-object UniffiNullRustCallStatusErrorHandler: UniffiRustCallStatusErrorHandler<InternalException> {
+object UniffiNullRustCallStatusErrorHandler : UniffiRustCallStatusErrorHandler<InternalException> {
     override fun lift(error_buf: RustBuffer.ByValue): InternalException {
         RustBuffer.free(error_buf)
         return InternalException("Unexpected CALL_ERROR")
@@ -304,32 +334,31 @@ object UniffiNullRustCallStatusErrorHandler: UniffiRustCallStatusErrorHandler<In
 }
 
 // Call a rust function that returns a plain value
-private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U {
-    return uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
-}
+private inline fun <U> uniffiRustCall(callback: (UniffiRustCallStatus) -> U): U =
+    uniffiRustCallWithError(UniffiNullRustCallStatusErrorHandler, callback)
 
-internal inline fun<T> uniffiTraitInterfaceCall(
+internal inline fun <T> uniffiTraitInterfaceCall(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
 ) {
     try {
         writeReturn(makeCall())
-    } catch(e: kotlin.Exception) {
+    } catch (e: kotlin.Exception) {
         callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
         callStatus.error_buf = FfiConverterString.lower(e.toString())
     }
 }
 
-internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
+internal inline fun <T, reified E : Throwable> uniffiTraitInterfaceCallWithError(
     callStatus: UniffiRustCallStatus,
     makeCall: () -> T,
     writeReturn: (T) -> Unit,
-    lowerError: (E) -> RustBuffer.ByValue
+    lowerError: (E) -> RustBuffer.ByValue,
 ) {
     try {
         writeReturn(makeCall())
-    } catch(e: kotlin.Exception) {
+    } catch (e: kotlin.Exception) {
         if (e is E) {
             callStatus.code = UNIFFI_CALL_ERROR
             callStatus.error_buf = lowerError(e)
@@ -339,12 +368,15 @@ internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
         }
     }
 }
+
 // Map handles to objects
 //
 // This is used pass an opaque 64-bit handle representing a foreign object to the Rust code.
-internal class UniffiHandleMap<T: Any> {
+internal class UniffiHandleMap<T : Any> {
     private val map = ConcurrentHashMap<Long, T>()
-    private val counter = java.util.concurrent.atomic.AtomicLong(0)
+    private val counter =
+        java.util.concurrent.atomic
+            .AtomicLong(0)
 
     val size: Int
         get() = map.size
@@ -357,14 +389,10 @@ internal class UniffiHandleMap<T: Any> {
     }
 
     // Get an object from the handle map
-    fun get(handle: Long): T {
-        return map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
-    }
+    fun get(handle: Long): T = map.get(handle) ?: throw InternalException("UniffiHandleMap.get: Invalid handle")
 
     // Remove an entry from the handlemap and get the Kotlin object back
-    fun remove(handle: Long): T {
-        return map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
-    }
+    fun remove(handle: Long): T = map.remove(handle) ?: throw InternalException("UniffiHandleMap: Invalid handle")
 }
 
 // Contains loading, initialization code,
@@ -378,22 +406,25 @@ private fun findLibraryName(componentName: String): String {
     return "guitar_trainer_core"
 }
 
-private inline fun <reified Lib : Library> loadIndirect(
-    componentName: String
-): Lib {
-    return Native.load<Lib>(findLibraryName(componentName), Lib::class.java)
-}
+private inline fun <reified Lib : Library> loadIndirect(componentName: String): Lib =
+    Native.load<Lib>(findLibraryName(componentName), Lib::class.java)
 
 // Define FFI callback types
 internal interface UniffiRustFutureContinuationCallback : com.sun.jna.Callback {
-    fun callback(`data`: Long,`pollResult`: Byte,)
+    fun callback(
+        `data`: Long,
+        `pollResult`: Byte,
+    )
 }
+
 internal interface UniffiForeignFutureFree : com.sun.jna.Callback {
-    fun callback(`handle`: Long,)
+    fun callback(`handle`: Long)
 }
+
 internal interface UniffiCallbackInterfaceFree : com.sun.jna.Callback {
-    fun callback(`handle`: Long,)
+    fun callback(`handle`: Long)
 }
+
 @Structure.FieldOrder("handle", "free")
 internal open class UniffiForeignFuture(
     @JvmField internal var `handle`: Long = 0.toLong(),
@@ -402,14 +433,15 @@ internal open class UniffiForeignFuture(
     class UniffiByValue(
         `handle`: Long = 0.toLong(),
         `free`: UniffiForeignFutureFree? = null,
-    ): UniffiForeignFuture(`handle`,`free`,), Structure.ByValue
+    ) : UniffiForeignFuture(`handle`, `free`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFuture) {
+    internal fun uniffiSetValue(other: UniffiForeignFuture) {
         `handle` = other.`handle`
         `free` = other.`free`
     }
-
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -418,17 +450,22 @@ internal open class UniffiForeignFutureStructU8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructU8(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructU8(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructU8) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructU8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU8 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU8.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructU8.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI8(
     @JvmField internal var `returnValue`: Byte = 0.toByte(),
@@ -437,17 +474,22 @@ internal open class UniffiForeignFutureStructI8(
     class UniffiByValue(
         `returnValue`: Byte = 0.toByte(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructI8(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructI8(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructI8) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructI8) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI8 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI8.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructI8.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -456,17 +498,22 @@ internal open class UniffiForeignFutureStructU16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructU16(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructU16(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructU16) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructU16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU16 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU16.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructU16.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI16(
     @JvmField internal var `returnValue`: Short = 0.toShort(),
@@ -475,17 +522,22 @@ internal open class UniffiForeignFutureStructI16(
     class UniffiByValue(
         `returnValue`: Short = 0.toShort(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructI16(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructI16(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructI16) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructI16) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI16 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI16.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructI16.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -494,17 +546,22 @@ internal open class UniffiForeignFutureStructU32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructU32(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructU32(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructU32) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructU32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU32 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU32.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructU32.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI32(
     @JvmField internal var `returnValue`: Int = 0,
@@ -513,17 +570,22 @@ internal open class UniffiForeignFutureStructI32(
     class UniffiByValue(
         `returnValue`: Int = 0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructI32(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructI32(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructI32) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructI32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI32 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI32.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructI32.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructU64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -532,17 +594,22 @@ internal open class UniffiForeignFutureStructU64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructU64(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructU64(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructU64) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructU64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteU64 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructU64.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructU64.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructI64(
     @JvmField internal var `returnValue`: Long = 0.toLong(),
@@ -551,17 +618,22 @@ internal open class UniffiForeignFutureStructI64(
     class UniffiByValue(
         `returnValue`: Long = 0.toLong(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructI64(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructI64(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructI64) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructI64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteI64 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructI64.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructI64.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructF32(
     @JvmField internal var `returnValue`: Float = 0.0f,
@@ -570,17 +642,22 @@ internal open class UniffiForeignFutureStructF32(
     class UniffiByValue(
         `returnValue`: Float = 0.0f,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructF32(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructF32(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructF32) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructF32) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteF32 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructF32.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructF32.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructF64(
     @JvmField internal var `returnValue`: Double = 0.0,
@@ -589,17 +666,22 @@ internal open class UniffiForeignFutureStructF64(
     class UniffiByValue(
         `returnValue`: Double = 0.0,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructF64(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructF64(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructF64) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructF64) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteF64 : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructF64.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructF64.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructPointer(
     @JvmField internal var `returnValue`: Pointer = Pointer.NULL,
@@ -608,17 +690,22 @@ internal open class UniffiForeignFutureStructPointer(
     class UniffiByValue(
         `returnValue`: Pointer = Pointer.NULL,
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructPointer(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructPointer(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructPointer) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructPointer) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompletePointer : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructPointer.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructPointer.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("returnValue", "callStatus")
 internal open class UniffiForeignFutureStructRustBuffer(
     @JvmField internal var `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
@@ -627,36 +714,52 @@ internal open class UniffiForeignFutureStructRustBuffer(
     class UniffiByValue(
         `returnValue`: RustBuffer.ByValue = RustBuffer.ByValue(),
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructRustBuffer(`returnValue`,`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructRustBuffer(`returnValue`, `callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructRustBuffer) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructRustBuffer) {
         `returnValue` = other.`returnValue`
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteRustBuffer : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructRustBuffer.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructRustBuffer.UniffiByValue,
+    )
 }
+
 @Structure.FieldOrder("callStatus")
 internal open class UniffiForeignFutureStructVoid(
     @JvmField internal var `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
 ) : Structure() {
     class UniffiByValue(
         `callStatus`: UniffiRustCallStatus.ByValue = UniffiRustCallStatus.ByValue(),
-    ): UniffiForeignFutureStructVoid(`callStatus`,), Structure.ByValue
+    ) : UniffiForeignFutureStructVoid(`callStatus`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiForeignFutureStructVoid) {
+    internal fun uniffiSetValue(other: UniffiForeignFutureStructVoid) {
         `callStatus` = other.`callStatus`
     }
+}
 
-}
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
-    fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructVoid.UniffiByValue,)
+    fun callback(
+        `callbackData`: Long,
+        `result`: UniffiForeignFutureStructVoid.UniffiByValue,
+    )
 }
+
 internal interface UniffiCallbackInterfaceEngineListenerMethod0 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`ev`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(
+        `uniffiHandle`: Long,
+        `ev`: RustBuffer.ByValue,
+        `uniffiOutReturn`: Pointer,
+        uniffiCallStatus: UniffiRustCallStatus,
+    )
 }
+
 @Structure.FieldOrder("onEvent", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceEngineListener(
     @JvmField internal var `onEvent`: UniffiCallbackInterfaceEngineListenerMethod0? = null,
@@ -665,91 +768,14 @@ internal open class UniffiVTableCallbackInterfaceEngineListener(
     class UniffiByValue(
         `onEvent`: UniffiCallbackInterfaceEngineListenerMethod0? = null,
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
-    ): UniffiVTableCallbackInterfaceEngineListener(`onEvent`,`uniffiFree`,), Structure.ByValue
+    ) : UniffiVTableCallbackInterfaceEngineListener(`onEvent`, `uniffiFree`),
+        Structure.ByValue
 
-   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceEngineListener) {
+    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceEngineListener) {
         `onEvent` = other.`onEvent`
         `uniffiFree` = other.`uniffiFree`
     }
-
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
@@ -758,174 +784,305 @@ internal interface UniffiLib : Library {
     companion object {
         internal val INSTANCE: UniffiLib by lazy {
             loadIndirect<UniffiLib>(componentName = "guitar_trainer_core")
-            .also { lib: UniffiLib ->
-                uniffiCheckContractApiVersion(lib)
-                uniffiCheckApiChecksums(lib)
-                uniffiCallbackInterfaceEngineListener.register(lib)
+                .also { lib: UniffiLib ->
+                    uniffiCheckContractApiVersion(lib)
+                    uniffiCheckApiChecksums(lib)
+                    uniffiCallbackInterfaceEngineListener.register(lib)
                 }
         }
-        
+
         // The Cleaner for the whole library
         internal val CLEANER: UniffiCleaner by lazy {
             UniffiCleaner.create()
         }
     }
 
-    fun uniffi_guitar_trainer_core_fn_clone_engine(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_guitar_trainer_core_fn_clone_engine(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_guitar_trainer_core_fn_free_engine(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_free_engine(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_config(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_config(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_progress(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_progress(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_set_config(`ptr`: Pointer,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_set_config(
+        `ptr`: Pointer,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_skip(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_skip(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_start(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_start(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_stop(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_method_engine_ffi_stop(
+        `ptr`: Pointer,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_guitar_trainer_core_fn_init_callback_vtable_enginelistener(`vtable`: UniffiVTableCallbackInterfaceEngineListener,
-    ): Unit
-    fun uniffi_guitar_trainer_core_fn_func_create_engine(`config`: RustBuffer.ByValue,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_init_callback_vtable_enginelistener(`vtable`: UniffiVTableCallbackInterfaceEngineListener): Unit
+
+    fun uniffi_guitar_trainer_core_fn_func_create_engine(
+        `config`: RustBuffer.ByValue,
+        `listener`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_guitar_trainer_core_fn_func_load_config(uniffi_out_err: UniffiRustCallStatus, 
+
+    fun uniffi_guitar_trainer_core_fn_func_load_config(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
+    fun ffi_guitar_trainer_core_rustbuffer_alloc(
+        `size`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun ffi_guitar_trainer_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rustbuffer_from_bytes(
+        `bytes`: ForeignBytes.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun ffi_guitar_trainer_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rustbuffer_free(
+        `buf`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    fun ffi_guitar_trainer_core_rustbuffer_reserve(
+        `buf`: RustBuffer.ByValue,
+        `additional`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun ffi_guitar_trainer_core_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_poll_u8(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    fun ffi_guitar_trainer_core_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_u8(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_u8(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_u8(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_u8(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_u8(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun ffi_guitar_trainer_core_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_i8(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_i8(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_i8(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_i8(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_i8(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_i8(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun ffi_guitar_trainer_core_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_u16(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_u16(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_u16(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_u16(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_u16(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_u16(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Short
-    fun ffi_guitar_trainer_core_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_i16(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_i16(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_i16(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_i16(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_i16(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_i16(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Short
-    fun ffi_guitar_trainer_core_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_u32(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_u32(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_u32(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_u32(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_u32(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_u32(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Int
-    fun ffi_guitar_trainer_core_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_i32(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_i32(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_i32(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_i32(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_i32(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_i32(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Int
-    fun ffi_guitar_trainer_core_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_u64(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_u64(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_u64(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_u64(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_u64(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_u64(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    fun ffi_guitar_trainer_core_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_i64(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_i64(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_i64(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_i64(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_i64(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_i64(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    fun ffi_guitar_trainer_core_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_f32(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_f32(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_f32(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_f32(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_f32(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_f32(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Float
-    fun ffi_guitar_trainer_core_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_f64(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_f64(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_f64(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_f64(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_f64(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_f64(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Double
-    fun ffi_guitar_trainer_core_rust_future_poll_pointer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_pointer(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_pointer(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_pointer(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_pointer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_pointer(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_pointer(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_pointer(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun ffi_guitar_trainer_core_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_rust_buffer(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_rust_buffer(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_rust_buffer(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_rust_buffer(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_rust_buffer(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_rust_buffer(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun ffi_guitar_trainer_core_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_poll_void(
+        `handle`: Long,
+        `callback`: UniffiRustFutureContinuationCallback,
+        `callbackData`: Long,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_cancel_void(`handle`: Long,
+
+    fun ffi_guitar_trainer_core_rust_future_cancel_void(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_free_void(`handle`: Long): Unit
+
+    fun ffi_guitar_trainer_core_rust_future_complete_void(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun ffi_guitar_trainer_core_rust_future_free_void(`handle`: Long,
-    ): Unit
-    fun ffi_guitar_trainer_core_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    fun uniffi_guitar_trainer_core_checksum_func_create_engine(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_func_load_config(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_config(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_progress(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_set_config(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_skip(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_start(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_stop(
-    ): Short
-    fun uniffi_guitar_trainer_core_checksum_method_enginelistener_on_event(
-    ): Short
-    fun ffi_guitar_trainer_core_uniffi_contract_version(
-    ): Int
-    
+
+    fun uniffi_guitar_trainer_core_checksum_func_create_engine(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_func_load_config(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_config(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_progress(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_set_config(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_skip(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_start(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_method_engine_ffi_stop(): Short
+
+    fun uniffi_guitar_trainer_core_checksum_method_enginelistener_on_event(): Short
+
+    fun ffi_guitar_trainer_core_uniffi_contract_version(): Int
 }
 
 private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
@@ -973,7 +1130,6 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
 
 // Public interface members begin here.
 
-
 // Interface implemented by anything that can contain an object reference.
 //
 // Such types expose a `destroy()` method that must be called to cleanly
@@ -984,9 +1140,11 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
 // helper method to execute a block and destroy the object at the end.
 interface Disposable {
     fun destroy()
+
     companion object {
         fun destroy(vararg args: Any?) {
-            args.filterIsInstance<Disposable>()
+            args
+                .filterIsInstance<Disposable>()
                 .forEach(Disposable::destroy)
         }
     }
@@ -1007,7 +1165,7 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
         }
     }
 
-/** 
+/**
  * Used to instantiate an interface without an actual pointer, for fakes in tests, mostly.
  *
  * @suppress
@@ -1017,22 +1175,19 @@ object NoPointer
 /**
  * @suppress
  */
-public object FfiConverterUInt: FfiConverter<UInt, Int> {
-    override fun lift(value: Int): UInt {
-        return value.toUInt()
-    }
+public object FfiConverterUInt : FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt = value.toUInt()
 
-    override fun read(buf: ByteBuffer): UInt {
-        return lift(buf.getInt())
-    }
+    override fun read(buf: ByteBuffer): UInt = lift(buf.getInt())
 
-    override fun lower(value: UInt): Int {
-        return value.toInt()
-    }
+    override fun lower(value: UInt): Int = value.toInt()
 
     override fun allocationSize(value: UInt) = 4UL
 
-    override fun write(value: UInt, buf: ByteBuffer) {
+    override fun write(
+        value: UInt,
+        buf: ByteBuffer,
+    ) {
         buf.putInt(value.toInt())
     }
 }
@@ -1040,22 +1195,19 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
-public object FfiConverterULong: FfiConverter<ULong, Long> {
-    override fun lift(value: Long): ULong {
-        return value.toULong()
-    }
+public object FfiConverterULong : FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong = value.toULong()
 
-    override fun read(buf: ByteBuffer): ULong {
-        return lift(buf.getLong())
-    }
+    override fun read(buf: ByteBuffer): ULong = lift(buf.getLong())
 
-    override fun lower(value: ULong): Long {
-        return value.toLong()
-    }
+    override fun lower(value: ULong): Long = value.toLong()
 
     override fun allocationSize(value: ULong) = 8UL
 
-    override fun write(value: ULong, buf: ByteBuffer) {
+    override fun write(
+        value: ULong,
+        buf: ByteBuffer,
+    ) {
         buf.putLong(value.toLong())
     }
 }
@@ -1063,22 +1215,19 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 /**
  * @suppress
  */
-public object FfiConverterDouble: FfiConverter<Double, Double> {
-    override fun lift(value: Double): Double {
-        return value
-    }
+public object FfiConverterDouble : FfiConverter<Double, Double> {
+    override fun lift(value: Double): Double = value
 
-    override fun read(buf: ByteBuffer): Double {
-        return buf.getDouble()
-    }
+    override fun read(buf: ByteBuffer): Double = buf.getDouble()
 
-    override fun lower(value: Double): Double {
-        return value
-    }
+    override fun lower(value: Double): Double = value
 
     override fun allocationSize(value: Double) = 8UL
 
-    override fun write(value: Double, buf: ByteBuffer) {
+    override fun write(
+        value: Double,
+        buf: ByteBuffer,
+    ) {
         buf.putDouble(value)
     }
 }
@@ -1086,22 +1235,19 @@ public object FfiConverterDouble: FfiConverter<Double, Double> {
 /**
  * @suppress
  */
-public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
-    override fun lift(value: Byte): Boolean {
-        return value.toInt() != 0
-    }
+public object FfiConverterBoolean : FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean = value.toInt() != 0
 
-    override fun read(buf: ByteBuffer): Boolean {
-        return lift(buf.get())
-    }
+    override fun read(buf: ByteBuffer): Boolean = lift(buf.get())
 
-    override fun lower(value: Boolean): Byte {
-        return if (value) 1.toByte() else 0.toByte()
-    }
+    override fun lower(value: Boolean): Byte = if (value) 1.toByte() else 0.toByte()
 
     override fun allocationSize(value: Boolean) = 1UL
 
-    override fun write(value: Boolean, buf: ByteBuffer) {
+    override fun write(
+        value: Boolean,
+        buf: ByteBuffer,
+    ) {
         buf.put(lower(value))
     }
 }
@@ -1109,7 +1255,7 @@ public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
 /**
  * @suppress
  */
-public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
+public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
     // store our length and avoid writing it out to the buffer.
@@ -1156,13 +1302,15 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
         return sizeForLength + sizeForString
     }
 
-    override fun write(value: String, buf: ByteBuffer) {
+    override fun write(
+        value: String,
+        buf: ByteBuffer,
+    ) {
         val byteBuf = toUtf8(value)
         buf.putInt(byteBuf.limit())
         buf.put(byteBuf)
     }
 }
-
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -1261,7 +1409,6 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 // [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
 //
 
-
 /**
  * The cleaner interface for Object finalization code to run.
  * This is the entry point to any implementation that we're using.
@@ -1277,17 +1424,24 @@ interface UniffiCleaner {
         fun clean()
     }
 
-    fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable
+    fun register(
+        value: Any,
+        cleanUpTask: Runnable,
+    ): UniffiCleaner.Cleanable
 
     companion object
 }
 
 // The fallback Jna cleaner, which is available for both Android, and the JVM.
 private class UniffiJnaCleaner : UniffiCleaner {
-    private val cleaner = com.sun.jna.internal.Cleaner.getCleaner()
+    private val cleaner =
+        com.sun.jna.internal.Cleaner
+            .getCleaner()
 
-    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
-        UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(
+        value: Any,
+        cleanUpTask: Runnable,
+    ): UniffiCleaner.Cleanable = UniffiJnaCleanable(cleaner.register(value, cleanUpTask))
 }
 
 private class UniffiJnaCleanable(
@@ -1314,54 +1468,60 @@ private fun UniffiCleaner.Companion.create(): UniffiCleaner =
     }
 
 private class JavaLangRefCleaner : UniffiCleaner {
-    val cleaner = java.lang.ref.Cleaner.create()
+    val cleaner =
+        java.lang.ref.Cleaner
+            .create()
 
-    override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
-        JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
+    override fun register(
+        value: Any,
+        cleanUpTask: Runnable,
+    ): UniffiCleaner.Cleanable = JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
 }
 
 private class JavaLangRefCleanable(
-    val cleanable: java.lang.ref.Cleaner.Cleanable
+    val cleanable: java.lang.ref.Cleaner.Cleanable,
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
 }
+
 public interface EngineInterface {
-    
     /**
      * Snapshot of the current configuration as an [`FfiConfig`].
      */
     fun `ffiConfig`(): FfiConfig
-    
+
     /**
      * Timer progress for the UI.
      */
     fun `ffiProgress`(): FfiProgress
-    
+
     /**
      * Apply a new config from the foreign side and persist it.
      */
     fun `ffiSetConfig`(`config`: FfiConfig)
-    
+
     /**
      * Skip the current prompt (counts as a timeout).
      */
     fun `ffiSkip`()
-    
+
     /**
      * Begin practice (audio + driver loop + first prompt).
      */
     fun `ffiStart`()
-    
+
     /**
      * Stop practice and release the mic.
      */
     fun `ffiStop`()
-    
+
     companion object
 }
 
-open class Engine: Disposable, AutoCloseable, EngineInterface {
-
+open class Engine :
+    Disposable,
+    AutoCloseable,
+    EngineInterface {
     constructor(pointer: Pointer) {
         this.pointer = pointer
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
@@ -1411,7 +1571,7 @@ open class Engine: Disposable, AutoCloseable, EngineInterface {
             if (c == Long.MAX_VALUE) {
                 throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
             }
-        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
         // Now we can safely do the method call without the pointer being freed concurrently.
         try {
             return block(this.uniffiClonePointer())
@@ -1425,7 +1585,9 @@ open class Engine: Disposable, AutoCloseable, EngineInterface {
 
     // Use a static inner class instead of a closure so as not to accidentally
     // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+    private class UniffiCleanAction(
+        private val pointer: Pointer?,
+    ) : Runnable {
         override fun run() {
             pointer?.let { ptr ->
                 uniffiRustCall { status ->
@@ -1435,120 +1597,91 @@ open class Engine: Disposable, AutoCloseable, EngineInterface {
         }
     }
 
-    fun uniffiClonePointer(): Pointer {
-        return uniffiRustCall() { status ->
+    fun uniffiClonePointer(): Pointer =
+        uniffiRustCall { status ->
             UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_clone_engine(pointer!!, status)
         }
-    }
 
-    
     /**
      * Snapshot of the current configuration as an [`FfiConfig`].
-     */override fun `ffiConfig`(): FfiConfig {
-            return FfiConverterTypeFfiConfig.lift(
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_config(
-        it, _status)
-}
-    }
-    )
-    }
-    
+     */
+    override fun `ffiConfig`(): FfiConfig =
+        FfiConverterTypeFfiConfig.lift(
+            callWithPointer {
+                uniffiRustCall { _status ->
+                    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_config(it, _status)
+                }
+            },
+        )
 
-    
     /**
      * Timer progress for the UI.
-     */override fun `ffiProgress`(): FfiProgress {
-            return FfiConverterTypeFfiProgress.lift(
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_progress(
-        it, _status)
-}
-    }
-    )
-    }
-    
+     */
+    override fun `ffiProgress`(): FfiProgress =
+        FfiConverterTypeFfiProgress.lift(
+            callWithPointer {
+                uniffiRustCall { _status ->
+                    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_progress(it, _status)
+                }
+            },
+        )
 
-    
     /**
      * Apply a new config from the foreign side and persist it.
      */
-    @Throws(FfiException::class)override fun `ffiSetConfig`(`config`: FfiConfig)
-        = 
-    callWithPointer {
-    uniffiRustCallWithError(FfiException) { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_set_config(
-        it, FfiConverterTypeFfiConfig.lower(`config`),_status)
-}
-    }
-    
-    
+    @Throws(FfiException::class)
+    override fun `ffiSetConfig`(`config`: FfiConfig) =
+        callWithPointer {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_set_config(
+                    it,
+                    FfiConverterTypeFfiConfig.lower(`config`),
+                    _status,
+                )
+            }
+        }
 
-    
     /**
      * Skip the current prompt (counts as a timeout).
-     */override fun `ffiSkip`()
-        = 
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_skip(
-        it, _status)
-}
-    }
-    
-    
+     */
+    override fun `ffiSkip`() =
+        callWithPointer {
+            uniffiRustCall { _status ->
+                UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_skip(it, _status)
+            }
+        }
 
-    
     /**
      * Begin practice (audio + driver loop + first prompt).
      */
-    @Throws(FfiException::class)override fun `ffiStart`()
-        = 
-    callWithPointer {
-    uniffiRustCallWithError(FfiException) { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_start(
-        it, _status)
-}
-    }
-    
-    
+    @Throws(FfiException::class)
+    override fun `ffiStart`() =
+        callWithPointer {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_start(it, _status)
+            }
+        }
 
-    
     /**
      * Stop practice and release the mic.
-     */override fun `ffiStop`()
-        = 
-    callWithPointer {
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_stop(
-        it, _status)
-}
-    }
-    
-    
+     */
+    override fun `ffiStop`() =
+        callWithPointer {
+            uniffiRustCall { _status ->
+                UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_method_engine_ffi_stop(it, _status)
+            }
+        }
 
-    
-
-    
-    
     companion object
-    
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeEngine: FfiConverter<Engine, Pointer> {
+public object FfiConverterTypeEngine : FfiConverter<Engine, Pointer> {
+    override fun lower(value: Engine): Pointer = value.uniffiClonePointer()
 
-    override fun lower(value: Engine): Pointer {
-        return value.uniffiClonePointer()
-    }
-
-    override fun lift(value: Pointer): Engine {
-        return Engine(value)
-    }
+    override fun lift(value: Pointer): Engine = Engine(value)
 
     override fun read(buf: ByteBuffer): Engine {
         // The Rust code always writes pointers as 8 bytes, and will
@@ -1558,408 +1691,481 @@ public object FfiConverterTypeEngine: FfiConverter<Engine, Pointer> {
 
     override fun allocationSize(value: Engine) = 8UL
 
-    override fun write(value: Engine, buf: ByteBuffer) {
+    override fun write(
+        value: Engine,
+        buf: ByteBuffer,
+    ) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
 
-
-
 /**
  * UI-facing challenge record (owned, no `Note` leakage — UniFFI-friendly).
  */
-data class ChallengeView (
-    var `kind`: kotlin.String, 
-    var `display`: kotlin.String, 
-    var `targets`: List<kotlin.String>, 
-    var `ordered`: kotlin.Boolean
+data class ChallengeView(
+    var `kind`: kotlin.String,
+    var `display`: kotlin.String,
+    var `targets`: List<kotlin.String>,
+    var `ordered`: kotlin.Boolean,
+    /**
+     * Listen-and-repeat prompt: targets sound, UI masks names until matched.
+     */
+    var `listen`: kotlin.Boolean,
 ) {
-    
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeChallengeView: FfiConverterRustBuffer<ChallengeView> {
-    override fun read(buf: ByteBuffer): ChallengeView {
-        return ChallengeView(
+public object FfiConverterTypeChallengeView : FfiConverterRustBuffer<ChallengeView> {
+    override fun read(buf: ByteBuffer): ChallengeView =
+        ChallengeView(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterSequenceString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
-    }
 
-    override fun allocationSize(value: ChallengeView) = (
+    override fun allocationSize(value: ChallengeView) =
+        (
             FfiConverterString.allocationSize(value.`kind`) +
-            FfiConverterString.allocationSize(value.`display`) +
-            FfiConverterSequenceString.allocationSize(value.`targets`) +
-            FfiConverterBoolean.allocationSize(value.`ordered`)
-    )
+                FfiConverterString.allocationSize(value.`display`) +
+                FfiConverterSequenceString.allocationSize(value.`targets`) +
+                FfiConverterBoolean.allocationSize(value.`ordered`) +
+                FfiConverterBoolean.allocationSize(value.`listen`)
+        )
 
-    override fun write(value: ChallengeView, buf: ByteBuffer) {
-            FfiConverterString.write(value.`kind`, buf)
-            FfiConverterString.write(value.`display`, buf)
-            FfiConverterSequenceString.write(value.`targets`, buf)
-            FfiConverterBoolean.write(value.`ordered`, buf)
+    override fun write(
+        value: ChallengeView,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`kind`, buf)
+        FfiConverterString.write(value.`display`, buf)
+        FfiConverterSequenceString.write(value.`targets`, buf)
+        FfiConverterBoolean.write(value.`ordered`, buf)
+        FfiConverterBoolean.write(value.`listen`, buf)
     }
 }
-
-
 
 /**
  * FFI-friendly config record (the `enumset` set is exposed as a `Vec<String>`
  * of category labels: `"Note", "Chord", "Scale", "Mode", "Progression",
  * "Lick", "Piece"`).
  */
-data class FfiConfig (
-    var `defaultDurationSec`: kotlin.UInt, 
-    var `enabled`: List<kotlin.String>, 
-    var `randomMode`: kotlin.Boolean, 
-    var `customContentPath`: kotlin.String?, 
-    var `audioDeviceName`: kotlin.String?, 
-    var `tuning`: kotlin.String, 
-    var `matchPauseMs`: kotlin.UInt
+data class FfiConfig(
+    var `defaultDurationSec`: kotlin.UInt,
+    var `enabled`: List<kotlin.String>,
+    var `randomMode`: kotlin.Boolean,
+    /**
+     * Hard difficulty: ordered prompts reset to the first note on any
+     * newly-struck wrong note. Defaults off.
+     */
+    var `hardSequence`: kotlin.Boolean,
+    var `customContentPath`: kotlin.String?,
+    var `customTuningPath`: kotlin.String?,
+    var `audioDeviceName`: kotlin.String?,
+    var `tuning`: kotlin.String,
+    var `matchPauseMs`: kotlin.UInt,
 ) {
-    
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeFfiConfig: FfiConverterRustBuffer<FfiConfig> {
-    override fun read(buf: ByteBuffer): FfiConfig {
-        return FfiConfig(
+public object FfiConverterTypeFfiConfig : FfiConverterRustBuffer<FfiConfig> {
+    override fun read(buf: ByteBuffer): FfiConfig =
+        FfiConfig(
             FfiConverterUInt.read(buf),
             FfiConverterSequenceString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterUInt.read(buf),
         )
-    }
 
-    override fun allocationSize(value: FfiConfig) = (
+    override fun allocationSize(value: FfiConfig) =
+        (
             FfiConverterUInt.allocationSize(value.`defaultDurationSec`) +
-            FfiConverterSequenceString.allocationSize(value.`enabled`) +
-            FfiConverterBoolean.allocationSize(value.`randomMode`) +
-            FfiConverterOptionalString.allocationSize(value.`customContentPath`) +
-            FfiConverterOptionalString.allocationSize(value.`audioDeviceName`) +
-            FfiConverterString.allocationSize(value.`tuning`) +
-            FfiConverterUInt.allocationSize(value.`matchPauseMs`)
-    )
+                FfiConverterSequenceString.allocationSize(value.`enabled`) +
+                FfiConverterBoolean.allocationSize(value.`randomMode`) +
+                FfiConverterBoolean.allocationSize(value.`hardSequence`) +
+                FfiConverterOptionalString.allocationSize(value.`customContentPath`) +
+                FfiConverterOptionalString.allocationSize(value.`customTuningPath`) +
+                FfiConverterOptionalString.allocationSize(value.`audioDeviceName`) +
+                FfiConverterString.allocationSize(value.`tuning`) +
+                FfiConverterUInt.allocationSize(value.`matchPauseMs`)
+        )
 
-    override fun write(value: FfiConfig, buf: ByteBuffer) {
-            FfiConverterUInt.write(value.`defaultDurationSec`, buf)
-            FfiConverterSequenceString.write(value.`enabled`, buf)
-            FfiConverterBoolean.write(value.`randomMode`, buf)
-            FfiConverterOptionalString.write(value.`customContentPath`, buf)
-            FfiConverterOptionalString.write(value.`audioDeviceName`, buf)
-            FfiConverterString.write(value.`tuning`, buf)
-            FfiConverterUInt.write(value.`matchPauseMs`, buf)
+    override fun write(
+        value: FfiConfig,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterUInt.write(value.`defaultDurationSec`, buf)
+        FfiConverterSequenceString.write(value.`enabled`, buf)
+        FfiConverterBoolean.write(value.`randomMode`, buf)
+        FfiConverterBoolean.write(value.`hardSequence`, buf)
+        FfiConverterOptionalString.write(value.`customContentPath`, buf)
+        FfiConverterOptionalString.write(value.`customTuningPath`, buf)
+        FfiConverterOptionalString.write(value.`audioDeviceName`, buf)
+        FfiConverterString.write(value.`tuning`, buf)
+        FfiConverterUInt.write(value.`matchPauseMs`, buf)
     }
 }
-
-
 
 /**
  * Timer progress reported across the FFI.
  */
-data class FfiProgress (
+data class FfiProgress(
     /**
      * Fraction of time remaining for the current prompt, `[0.0, 1.0]`.
      */
-    var `frac`: kotlin.Double, 
+    var `frac`: kotlin.Double,
     /**
      * Seconds remaining (rounded).
      */
-    var `secs`: kotlin.ULong, 
+    var `secs`: kotlin.ULong,
     /**
      * Total seconds the current prompt started with.
      */
-    var `promptSecs`: kotlin.ULong
+    var `promptSecs`: kotlin.ULong,
 ) {
-    
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeFfiProgress: FfiConverterRustBuffer<FfiProgress> {
-    override fun read(buf: ByteBuffer): FfiProgress {
-        return FfiProgress(
+public object FfiConverterTypeFfiProgress : FfiConverterRustBuffer<FfiProgress> {
+    override fun read(buf: ByteBuffer): FfiProgress =
+        FfiProgress(
             FfiConverterDouble.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
-    }
 
-    override fun allocationSize(value: FfiProgress) = (
+    override fun allocationSize(value: FfiProgress) =
+        (
             FfiConverterDouble.allocationSize(value.`frac`) +
-            FfiConverterULong.allocationSize(value.`secs`) +
-            FfiConverterULong.allocationSize(value.`promptSecs`)
-    )
+                FfiConverterULong.allocationSize(value.`secs`) +
+                FfiConverterULong.allocationSize(value.`promptSecs`)
+        )
 
-    override fun write(value: FfiProgress, buf: ByteBuffer) {
-            FfiConverterDouble.write(value.`frac`, buf)
-            FfiConverterULong.write(value.`secs`, buf)
-            FfiConverterULong.write(value.`promptSecs`, buf)
+    override fun write(
+        value: FfiProgress,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterDouble.write(value.`frac`, buf)
+        FfiConverterULong.write(value.`secs`, buf)
+        FfiConverterULong.write(value.`promptSecs`, buf)
     }
 }
-
-
 
 /**
  * All events the engine emits to a listener.
  */
 sealed class EngineEvent {
-    
     /**
      * A new prompt to display.
      */
     data class Prompt(
-        val v1: ChallengeView) : EngineEvent() {
+        val v1: ChallengeView,
+    ) : EngineEvent() {
         companion object
     }
-    
+
     /**
      * Last stable detected note name (or `None`).
      */
     data class DetectedNote(
-        val v1: kotlin.String?) : EngineEvent() {
+        val v1: kotlin.String?,
+    ) : EngineEvent() {
         companion object
     }
-    
+
     /**
      * One target was matched.
      */
     data class Matched(
-        val `index`: kotlin.ULong, 
-        val `total`: kotlin.ULong) : EngineEvent() {
+        val `index`: kotlin.ULong,
+        val `total`: kotlin.ULong,
+    ) : EngineEvent() {
         companion object
     }
-    
+
     /**
      * All targets matched before the timer expired.
      */
     object Passed : EngineEvent()
-    
-    
+
     /**
      * Emitted once when a completed challenge triggers the post-match pause.
      * UI frontends self-time an animation for `duration_ms` from receipt of
      * this event; the engine does not emit further per-tick updates during it.
      */
     data class Cooldown(
-        val `durationMs`: kotlin.ULong) : EngineEvent() {
+        val `durationMs`: kotlin.ULong,
+    ) : EngineEvent() {
         companion object
     }
-    
+
     /**
      * The timer expired with targets still outstanding.
      */
     object Timeout : EngineEvent()
-    
-    
+
     /**
      * Running score.
      */
     data class Score(
-        val `passed`: kotlin.UInt, 
-        val `total`: kotlin.UInt) : EngineEvent() {
+        val `passed`: kotlin.UInt,
+        val `total`: kotlin.UInt,
+    ) : EngineEvent() {
         companion object
     }
-    
 
-    
+    /**
+     * Hard mode: the player struck a new wrong note; per-target progress
+     * reset to the first note (prompt/timer/score unchanged).
+     */
+    object Mistake : EngineEvent()
+
     companion object
 }
 
 /**
  * @suppress
  */
-public object FfiConverterTypeEngineEvent : FfiConverterRustBuffer<EngineEvent>{
-    override fun read(buf: ByteBuffer): EngineEvent {
-        return when(buf.getInt()) {
-            1 -> EngineEvent.Prompt(
-                FfiConverterTypeChallengeView.read(buf),
+public object FfiConverterTypeEngineEvent : FfiConverterRustBuffer<EngineEvent> {
+    override fun read(buf: ByteBuffer): EngineEvent =
+        when (buf.getInt()) {
+            1 -> {
+                EngineEvent.Prompt(
+                    FfiConverterTypeChallengeView.read(buf),
                 )
-            2 -> EngineEvent.DetectedNote(
-                FfiConverterOptionalString.read(buf),
-                )
-            3 -> EngineEvent.Matched(
-                FfiConverterULong.read(buf),
-                FfiConverterULong.read(buf),
-                )
-            4 -> EngineEvent.Passed
-            5 -> EngineEvent.Cooldown(
-                FfiConverterULong.read(buf),
-                )
-            6 -> EngineEvent.Timeout
-            7 -> EngineEvent.Score(
-                FfiConverterUInt.read(buf),
-                FfiConverterUInt.read(buf),
-                )
-            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
-        }
-    }
+            }
 
-    override fun allocationSize(value: EngineEvent) = when(value) {
-        is EngineEvent.Prompt -> {
-            // Add the size for the Int that specifies the variant plus the size needed for all fields
-            (
-                4UL
-                + FfiConverterTypeChallengeView.allocationSize(value.v1)
-            )
-        }
-        is EngineEvent.DetectedNote -> {
-            // Add the size for the Int that specifies the variant plus the size needed for all fields
-            (
-                4UL
-                + FfiConverterOptionalString.allocationSize(value.v1)
-            )
-        }
-        is EngineEvent.Matched -> {
-            // Add the size for the Int that specifies the variant plus the size needed for all fields
-            (
-                4UL
-                + FfiConverterULong.allocationSize(value.`index`)
-                + FfiConverterULong.allocationSize(value.`total`)
-            )
-        }
-        is EngineEvent.Passed -> {
-            // Add the size for the Int that specifies the variant plus the size needed for all fields
-            (
-                4UL
-            )
-        }
-        is EngineEvent.Cooldown -> {
-            // Add the size for the Int that specifies the variant plus the size needed for all fields
-            (
-                4UL
-                + FfiConverterULong.allocationSize(value.`durationMs`)
-            )
-        }
-        is EngineEvent.Timeout -> {
-            // Add the size for the Int that specifies the variant plus the size needed for all fields
-            (
-                4UL
-            )
-        }
-        is EngineEvent.Score -> {
-            // Add the size for the Int that specifies the variant plus the size needed for all fields
-            (
-                4UL
-                + FfiConverterUInt.allocationSize(value.`passed`)
-                + FfiConverterUInt.allocationSize(value.`total`)
-            )
-        }
-    }
+            2 -> {
+                EngineEvent.DetectedNote(
+                    FfiConverterOptionalString.read(buf),
+                )
+            }
 
-    override fun write(value: EngineEvent, buf: ByteBuffer) {
-        when(value) {
+            3 -> {
+                EngineEvent.Matched(
+                    FfiConverterULong.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            4 -> {
+                EngineEvent.Passed
+            }
+
+            5 -> {
+                EngineEvent.Cooldown(
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            6 -> {
+                EngineEvent.Timeout
+            }
+
+            7 -> {
+                EngineEvent.Score(
+                    FfiConverterUInt.read(buf),
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            8 -> {
+                EngineEvent.Mistake
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: EngineEvent) =
+        when (value) {
+            is EngineEvent.Prompt -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeChallengeView.allocationSize(value.v1)
+                )
+            }
+
+            is EngineEvent.DetectedNote -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterOptionalString.allocationSize(value.v1)
+                )
+            }
+
+            is EngineEvent.Matched -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`index`) +
+                        FfiConverterULong.allocationSize(value.`total`)
+                )
+            }
+
+            is EngineEvent.Passed -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is EngineEvent.Cooldown -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`durationMs`)
+                )
+            }
+
+            is EngineEvent.Timeout -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is EngineEvent.Score -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`passed`) +
+                        FfiConverterUInt.allocationSize(value.`total`)
+                )
+            }
+
+            is EngineEvent.Mistake -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+        }
+
+    override fun write(
+        value: EngineEvent,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
             is EngineEvent.Prompt -> {
                 buf.putInt(1)
                 FfiConverterTypeChallengeView.write(value.v1, buf)
                 Unit
             }
+
             is EngineEvent.DetectedNote -> {
                 buf.putInt(2)
                 FfiConverterOptionalString.write(value.v1, buf)
                 Unit
             }
+
             is EngineEvent.Matched -> {
                 buf.putInt(3)
                 FfiConverterULong.write(value.`index`, buf)
                 FfiConverterULong.write(value.`total`, buf)
                 Unit
             }
+
             is EngineEvent.Passed -> {
                 buf.putInt(4)
                 Unit
             }
+
             is EngineEvent.Cooldown -> {
                 buf.putInt(5)
                 FfiConverterULong.write(value.`durationMs`, buf)
                 Unit
             }
+
             is EngineEvent.Timeout -> {
                 buf.putInt(6)
                 Unit
             }
+
             is EngineEvent.Score -> {
                 buf.putInt(7)
                 FfiConverterUInt.write(value.`passed`, buf)
                 FfiConverterUInt.write(value.`total`, buf)
                 Unit
             }
+
+            is EngineEvent.Mistake -> {
+                buf.putInt(8)
+                Unit
+            }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
 
-
-
-
-
-
-
 /**
  * Error type crossing the FFI. UniFFI 0.28 cannot throw bare `String`, so we
  */
-sealed class FfiException: kotlin.Exception() {
-    
+sealed class FfiException : kotlin.Exception() {
     /**
      * Human-readable error message.
      */
     class Message(
-        
-        val v1: kotlin.String
-        ) : FfiException() {
+        val v1: kotlin.String,
+    ) : FfiException() {
         override val message
             get() = "v1=${ v1 }"
     }
-    
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
-
-    
 }
 
 /**
  * @suppress
  */
 public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
-    override fun read(buf: ByteBuffer): FfiException {
-        
-
-        return when(buf.getInt()) {
-            1 -> FfiException.Message(
-                FfiConverterString.read(buf),
+    override fun read(buf: ByteBuffer): FfiException =
+        when (buf.getInt()) {
+            1 -> {
+                FfiException.Message(
+                    FfiConverterString.read(buf),
                 )
-            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
-        }
-    }
+            }
 
-    override fun allocationSize(value: FfiException): ULong {
-        return when(value) {
+            else -> {
+                throw RuntimeException("invalid error enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: FfiException): ULong =
+        when (value) {
             is FfiException.Message -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.v1)
+                4UL +
+                    FfiConverterString.allocationSize(value.v1)
             )
         }
-    }
 
-    override fun write(value: FfiException, buf: ByteBuffer) {
-        when(value) {
+    override fun write(
+        value: FfiException,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
             is FfiException.Message -> {
                 buf.putInt(1)
                 FfiConverterString.write(value.v1, buf)
@@ -1967,12 +2173,7 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
-
 }
-
-
-
-
 
 /**
  * Implement to receive engine events. Both the TUI and the Android Kotlin
@@ -1981,15 +2182,15 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
  * **Warning:** implementations must not call back into the [`Engine`] from
  */
 public interface EngineListener {
-    
     fun `onEvent`(`ev`: EngineEvent)
-    
+
     companion object
 }
 
 // Magic number for the Rust proxy to call using the same mechanism as every other method,
 // to free the callback once it's dropped by Rust.
 internal const val IDX_CALLBACK_FREE = 0
+
 // Callback return codes
 internal const val UNIFFI_CALLBACK_SUCCESS = 0
 internal const val UNIFFI_CALLBACK_ERROR = 1
@@ -1998,16 +2199,14 @@ internal const val UNIFFI_CALLBACK_UNEXPECTED_ERROR = 2
 /**
  * @suppress
  */
-public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: FfiConverter<CallbackInterface, Long> {
+public abstract class FfiConverterCallbackInterface<CallbackInterface : Any> : FfiConverter<CallbackInterface, Long> {
     internal val handleMap = UniffiHandleMap<CallbackInterface>()
 
     internal fun drop(handle: Long) {
         handleMap.remove(handle)
     }
 
-    override fun lift(value: Long): CallbackInterface {
-        return handleMap.get(value)
-    }
+    override fun lift(value: Long): CallbackInterface = handleMap.get(value)
 
     override fun read(buf: ByteBuffer) = lift(buf.getLong())
 
@@ -2015,36 +2214,44 @@ public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: Ffi
 
     override fun allocationSize(value: CallbackInterface) = 8UL
 
-    override fun write(value: CallbackInterface, buf: ByteBuffer) {
+    override fun write(
+        value: CallbackInterface,
+        buf: ByteBuffer,
+    ) {
         buf.putLong(lower(value))
     }
 }
 
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceEngineListener {
-    internal object `onEvent`: UniffiCallbackInterfaceEngineListenerMethod0 {
-        override fun callback(`uniffiHandle`: Long,`ev`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+    internal object `onEvent` : UniffiCallbackInterfaceEngineListenerMethod0 {
+        override fun callback(
+            `uniffiHandle`: Long,
+            `ev`: RustBuffer.ByValue,
+            `uniffiOutReturn`: Pointer,
+            uniffiCallStatus: UniffiRustCallStatus,
+        ) {
             val uniffiObj = FfiConverterTypeEngineListener.handleMap.get(uniffiHandle)
-            val makeCall = { ->
-                uniffiObj.`onEvent`(
-                    FfiConverterTypeEngineEvent.lift(`ev`),
-                )
+            val makeCall = {  uniffiObj.`onEvent`(
+                FfiConverterTypeEngineEvent.lift(`ev`),
+            )
             }
             val writeReturn = { _: Unit -> Unit }
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
 
-    internal object uniffiFree: UniffiCallbackInterfaceFree {
+    internal object uniffiFree : UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
             FfiConverterTypeEngineListener.handleMap.remove(handle)
         }
     }
 
-    internal var vtable = UniffiVTableCallbackInterfaceEngineListener.UniffiByValue(
-        `onEvent`,
-        uniffiFree,
-    )
+    internal var vtable =
+        UniffiVTableCallbackInterfaceEngineListener.UniffiByValue(
+            `onEvent`,
+            uniffiFree,
+        )
 
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
@@ -2058,15 +2265,12 @@ internal object uniffiCallbackInterfaceEngineListener {
  *
  * @suppress
  */
-public object FfiConverterTypeEngineListener: FfiConverterCallbackInterface<EngineListener>()
-
-
-
+public object FfiConverterTypeEngineListener : FfiConverterCallbackInterface<EngineListener>()
 
 /**
  * @suppress
  */
-public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?> {
     override fun read(buf: ByteBuffer): kotlin.String? {
         if (buf.get().toInt() == 0) {
             return null
@@ -2082,7 +2286,10 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         }
     }
 
-    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+    override fun write(
+        value: kotlin.String?,
+        buf: ByteBuffer,
+    ) {
         if (value == null) {
             buf.put(0)
         } else {
@@ -2092,13 +2299,10 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
     }
 }
 
-
-
-
 /**
  * @suppress
  */
-public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
+public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.String>> {
     override fun read(buf: ByteBuffer): List<kotlin.String> {
         val len = buf.getInt()
         return List<kotlin.String>(len) {
@@ -2112,37 +2316,42 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
         return sizeForLength + sizeForItems
     }
 
-    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
+    override fun write(
+        value: List<kotlin.String>,
+        buf: ByteBuffer,
+    ) {
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
         }
     }
 }
-        /**
-         * Construct an [`Engine`] for the foreign frontend.
-         */
-    @Throws(FfiException::class) fun `createEngine`(`config`: FfiConfig, `listener`: EngineListener): Engine {
-            return FfiConverterTypeEngine.lift(
-    uniffiRustCallWithError(FfiException) { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_func_create_engine(
-        FfiConverterTypeFfiConfig.lower(`config`),FfiConverterTypeEngineListener.lower(`listener`),_status)
-}
+
+/**
+ * Construct an [`Engine`] for the foreign frontend.
+ */
+@Throws(FfiException::class)
+fun `createEngine`(
+    `config`: FfiConfig,
+    `listener`: EngineListener,
+): Engine =
+    FfiConverterTypeEngine.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_func_create_engine(
+                FfiConverterTypeFfiConfig.lower(`config`),
+                FfiConverterTypeEngineListener.lower(`listener`),
+                _status,
+            )
+        },
     )
-    }
-    
 
-        /**
-         * Load the persisted config (or defaults) without constructing an Engine.
-         * Lets a frontend seed its `FfiConfig` from disk before it has an Engine.
-         */ fun `loadConfig`(): FfiConfig {
-            return FfiConverterTypeFfiConfig.lift(
-    uniffiRustCall() { _status ->
-    UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_func_load_config(
-        _status)
-}
+/**
+ * Load the persisted config (or defaults) without constructing an Engine.
+ * Lets a frontend seed its `FfiConfig` from disk before it has an Engine.
+ */
+fun `loadConfig`(): FfiConfig =
+    FfiConverterTypeFfiConfig.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.INSTANCE.uniffi_guitar_trainer_core_fn_func_load_config(_status)
+        },
     )
-    }
-    
-
-
