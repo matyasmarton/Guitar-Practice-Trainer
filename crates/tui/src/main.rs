@@ -743,9 +743,15 @@ fn selection_style(theme: &Theme) -> Style {
 }
 
 /// Colors for sequence positions after the first (which uses the theme
-/// accent). Distinct named ANSI colors so they render in every terminal;
-/// cycles for longer prompts.
-const NOTE_PALETTE: [Color; 4] = [Color::Magenta, Color::Blue, Color::White, Color::Red];
+/// accent). Bright (high-intensity) named ANSI colors — the darker base
+/// variants blended into dark terminal backgrounds — so they render vividly
+/// in every terminal; cycles for longer prompts.
+const NOTE_PALETTE: [Color; 4] = [
+    Color::LightMagenta,
+    Color::LightBlue,
+    Color::White,
+    Color::LightRed,
+];
 
 /// The fretboard/chip color of target index `i`: index 0 is the theme
 /// accent ("default colour"), later positions cycle NOTE_PALETTE.
