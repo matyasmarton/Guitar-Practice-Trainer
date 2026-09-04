@@ -85,6 +85,9 @@ struct UiState {
     /// recent last. TUI-local bookkeeping for the Practice screen's Session
     /// panel — capped at `HISTORY_CAP`.
     history: VecDeque<Attempt>,
+    /// Moment a hard-mode mistake reset happened; renders a flash in the
+    /// heading caption until now+1500ms.
+    mistake_until: Option<std::time::Instant>,
 }
 
 /// Channel-backed listener: the render loop drains `rx`.
@@ -121,11 +124,10 @@ enum Edit {
     Path,
     TuningPath,
 }
-
+/// Settings rows: 0=Timer 1=Select tuning 2=Add custom tuning 3=Fretboard highlight 4=Random 5=Hard difficulty 6..=12=categories(7) 13=Audio Device 14=Custom Content Path 15=Back.
+const SETTINGS_ROW_COUNT: usize = 16;
 const MENU_ITEMS: [&str; 3] = ["Start Practice", "Settings", "Quit"];
 const PRACTICE_ACTIONS: [&str; 3] = ["Stop", "Skip", "Settings"];
-/// Settings rows: 0=Timer 1=Select tuning 2=Add custom tuning 3=Fretboard highlight 4=Random 5..=11=categories(7) 12=Audio Device 13=Custom Content Path 14=Back.
-const SETTINGS_ROW_COUNT: usize = 15;
 
 struct App {
     screen: Screen,
@@ -219,11 +221,10 @@ fn main() -> Result<()> {
             if let Event::Key(k) = event::read()? {
                 // Accept Press + Repeat, reject Release — robust across
                 // terminals that report key-up events (e.g. Kitty protocol).
-                if k.kind != KeyEventKind::Release {
-                    if !handle_key(k, &mut app, &mut settings, &engine, &mut ui) {
+                if k.kind != KeyEventKind::Release
+                    && !handle_key(k, &mut app, &mut settings, &engine, &mut ui) {
                         break; // Quit requested.
                     }
-                }
             }
         }
 
@@ -309,6 +310,11 @@ fn apply_event(ui: &mut UiState, ev: &EngineEvent) {
             ui.score_passed = *passed;
             ui.score_total = *total;
         }
+        EngineEvent::Mistake => {
+            ui.matched_indices = vec![false; ui.targets.len()];
+            ui.matched = 0;
+            ui.mistake_until = Some(std::time::Instant::now());
+        }
     }
 }
 
@@ -325,6 +331,7 @@ struct SettingsState {
     custom_tuning_status: Option<String>,
     enabled: Vec<(ChallengeType, bool)>,
     random_mode: bool,
+    hard_sequence: bool,
     fretboard_highlight: bool,
     custom_path: String,
     audio_device: Option<String>,
@@ -355,6 +362,7 @@ impl SettingsState {
             custom_tuning_status: None,
             enabled,
             random_mode: cfg.random_mode,
+            hard_sequence: cfg.hard_sequence,
             fretboard_highlight: cfg.fretboard_highlight,
             custom_path: cfg
                 .custom_content_path
@@ -382,6 +390,7 @@ impl SettingsState {
             enabled: set,
             random_mode: self.random_mode,
             fretboard_highlight: self.fretboard_highlight,
+            hard_sequence: self.hard_sequence,
             custom_content_path: if self.custom_path.is_empty() {
                 None
             } else {
@@ -580,6 +589,12 @@ fn handle_practice_key(
             app.screen = Screen::Menu;
             app.menu_idx = 0;
         }
+        KeyCode::Char('h' | 'H') => {
+            settings.hard_sequence = !settings.hard_sequence;
+            // Session-only: NOT saved to disk (the Settings row is the
+            // persisted default).
+            engine.set_config(settings.to_config());
+        }
         _ => {}
     }
     true
@@ -612,13 +627,14 @@ fn handle_settings_key(
             }
             3 => settings.fretboard_highlight = !settings.fretboard_highlight,
             4 => settings.random_mode = !settings.random_mode,
-            5..=11 => {
-                let i = app.settings_idx - 5;
+            5 => settings.hard_sequence = !settings.hard_sequence,
+            6..=12 => {
+                let i = app.settings_idx - 6;
                 if let Some(slot) = settings.enabled.get_mut(i) {
                     slot.1 = !slot.1;
                 }
             }
-            12 => {
+            13 => {
                 start_device_scan(app);
                 app.device_idx = settings
                     .audio_device
@@ -627,11 +643,11 @@ fn handle_settings_key(
                     .unwrap_or(0);
                 app.screen = Screen::DevicePick;
             }
-            13 => {
+            14 => {
                 app.edit = Edit::Path;
                 app.edit_buf = settings.custom_path.clone();
             }
-            14 => {
+            15 => {
                 apply_settings(settings, engine);
                 app.screen = if ui.running { Screen::Practice } else { Screen::Menu };
             }
@@ -724,6 +740,21 @@ fn selection_style(theme: &Theme) -> Style {
         .fg(theme_color(&theme.selection_fg, Color::Black))
         .bg(theme_color(&theme.selection_bg, Color::Yellow))
         .add_modifier(Modifier::BOLD)
+}
+
+/// Colors for sequence positions after the first (which uses the theme
+/// accent). Distinct named ANSI colors so they render in every terminal;
+/// cycles for longer prompts.
+const NOTE_PALETTE: [Color; 4] = [Color::Magenta, Color::Blue, Color::White, Color::Red];
+
+/// The fretboard/chip color of target index `i`: index 0 is the theme
+/// accent ("default colour"), later positions cycle NOTE_PALETTE.
+fn target_color(i: usize, theme: &Theme) -> Color {
+    if i == 0 {
+        theme_color(&theme.accent, Color::Yellow)
+    } else {
+        NOTE_PALETTE[(i - 1) % NOTE_PALETTE.len()]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,23 +1083,34 @@ fn center_v(rect: Rect, content_h: u16) -> Rect {
 /// existing light rounded corners (╭╮╰╯, kept because the chips were
 /// explicitly approved for their rounded look) with heavy straight lines
 /// (━ ┃, the same Box Drawing block already used for the light rules
-/// elsewhere in this file — no new/unverified Unicode range). Returns the
-/// inner `Rect`, matching `Block::inner`.
-fn render_thick_rounded_border(f: &mut ratatui::Frame<'_>, area: Rect, style: Style) -> Rect {
+/// elsewhere in this file — no new/unverified Unicode range). When
+/// `bottom` is `Some`, the bottom rule and its two corners draw in that
+/// style instead — the note chips' colored "underscore" — while the rest
+/// of the frame uses `style`. Returns the inner `Rect`, matching
+/// `Block::inner`.
+fn render_thick_rounded_border(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    style: Style,
+    bottom: Option<Style>,
+) -> Rect {
     if area.width < 2 || area.height < 2 {
         return area;
     }
     let buf = f.buffer_mut();
     let (x0, y0) = (area.x, area.y);
     let (x1, y1) = (area.x + area.width - 1, area.y + area.height - 1);
+    // The chip's colored "underscore": the bottom rule + its two corners
+    // drawn in `bottom` when given, everything else in `style`.
+    let bottom_style = bottom.unwrap_or(style);
     buf.set_string(x0, y0, "╭", style);
     buf.set_string(x1, y0, "╮", style);
-    buf.set_string(x0, y1, "╰", style);
-    buf.set_string(x1, y1, "╯", style);
+    buf.set_string(x0, y1, "╰", bottom_style);
+    buf.set_string(x1, y1, "╯", bottom_style);
     if x1 > x0 + 1 {
         let h = "━".repeat((x1 - x0 - 1) as usize);
         buf.set_string(x0 + 1, y0, &h, style);
-        buf.set_string(x0 + 1, y1, &h, style);
+        buf.set_string(x0 + 1, y1, &h, bottom_style);
     }
     for y in (y0 + 1)..y1 {
         buf.set_string(x0, y, "┃", style);
@@ -1105,8 +1147,11 @@ fn render_thick_rounded_border(f: &mut ratatui::Frame<'_>, area: Rect, style: St
 /// convention already used by `render_detected_indicator`; the two crisp
 /// tiers keep a leading checkmark. Ordered prompts chain the chips with
 /// an arrow so the required sequence reads left to right; unordered
-/// prompts space them evenly.
-fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+/// prompts space them evenly. While Fretboard highlight is ON, every
+/// still-needed chip carries a colored underscore (its bottom border rule
+/// in `target_color(i)`) matching that note's cells on the fretboard;
+/// matched chips drop the underscore and turn fully green.
+fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme, highlight: bool) {
     if ui.targets.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
@@ -1134,7 +1179,7 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     // need manual letter-spacing to avoid reading cramped — glyph labels
     // skip it: keeps chips narrower, so more simultaneous targets qualify
     // for glyph rendering instead of falling back.
-    let glyph_labels: Vec<String> = ui.targets.iter().map(|t| t.clone()).collect();
+    let glyph_labels: Vec<String> = ui.targets.iter().cloned().collect();
     let spaced_labels = crisp_labels(true);
     let compact_labels = crisp_labels(false);
 
@@ -1202,7 +1247,12 @@ fn render_targets_row(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
         let rect = cells[ci];
         ci += 1;
         let (border_style, text_style) = if matched { (success, success) } else { (idle_border, idle_text) };
-        let inner = render_thick_rounded_border(f, rect, border_style);
+        let bottom = if highlight && !matched {
+            Some(Style::default().fg(target_color(i, theme)))
+        } else {
+            None
+        };
+        let inner = render_thick_rounded_border(f, rect, border_style, bottom);
         if let Some(pixel_size) = glyph_pixel_size {
             let glyph = BigText::builder()
                 .pixel_size(pixel_size)
@@ -1241,31 +1291,38 @@ fn detected_correctness(ui: &UiState) -> Option<bool> {
     }
 }
 
-/// The prompt's still-needed target note names, right now — mirrors
-/// `detected_correctness`'s ordered/unordered rule (only the *next* target
-/// counts when `ui.ordered`; every still-unmatched target counts otherwise)
-/// but returns the whole set instead of judging one detected note. Used by
-/// `render_fretboard` to highlight where those notes live on the board.
-fn active_target_names(ui: &UiState) -> Vec<&str> {
+/// Map of note name → highlight color for the currently still-needed
+/// targets. Ordered: every still-needed index from the first unmatched
+/// onward, each in its own position color; a note appearing at several
+/// still-needed indices takes the color of the earliest such index.
+/// Unordered: every still-needed target in the theme accent.
+/// Empty when nothing is still needed.
+fn target_highlight_colors(ui: &UiState, theme: &Theme) -> Vec<(String, Color)> {
     if ui.ordered {
-        ui.matched_indices
-            .iter()
-            .position(|m| !m)
-            .and_then(|i| ui.targets.get(i))
-            .map(|t| vec![t.as_str()])
-            .unwrap_or_default()
+        let Some(first) = ui.matched_indices.iter().position(|m| !m) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, Color)> = Vec::new();
+        for i in first..ui.targets.len() {
+            let name = &ui.targets[i];
+            if out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            out.push((name.clone(), target_color(i, theme)));
+        }
+        out
     } else {
         ui.targets
             .iter()
             .enumerate()
             .filter(|(i, _)| !ui.matched_indices.get(*i).copied().unwrap_or(false))
-            .map(|(_, t)| t.as_str())
+            .map(|(_, t)| (t.clone(), target_color(0, theme)))
             .collect()
     }
 }
 
 #[cfg(test)]
-mod active_target_names_tests {
+mod target_highlight_colors_tests {
     use super::*;
 
     fn ui_with(targets: &[&str], matched: &[bool], ordered: bool) -> UiState {
@@ -1277,28 +1334,54 @@ mod active_target_names_tests {
         }
     }
 
-    #[test]
-    fn unordered_returns_every_unmatched_target() {
-        let ui = ui_with(&["A2", "B2", "C3"], &[false, true, false], false);
-        assert_eq!(active_target_names(&ui), vec!["A2", "C3"]);
+    fn theme() -> Theme {
+        Theme::default()
     }
 
     #[test]
-    fn ordered_returns_only_the_next_target() {
+    fn unordered_returns_every_unmatched_target_in_accent() {
+        let ui = ui_with(&["A2", "B2", "C3"], &[false, true, false], false);
+        let accent = target_color(0, &theme());
+        assert_eq!(
+            target_highlight_colors(&ui, &theme()),
+            vec![("A2".to_string(), accent), ("C3".to_string(), accent)]
+        );
+    }
+
+    #[test]
+    fn ordered_returns_still_needed_in_position_colors() {
         let ui = ui_with(&["A2", "B2", "C3"], &[true, false, false], true);
-        assert_eq!(active_target_names(&ui), vec!["B2"]);
+        assert_eq!(
+            target_highlight_colors(&ui, &theme()),
+            vec![
+                ("B2".to_string(), target_color(1, &theme())),
+                ("C3".to_string(), target_color(2, &theme()))
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_duplicate_names_take_earliest_index_color() {
+        let ui = ui_with(&["A2", "A2", "B2"], &[false, false, false], true);
+        assert_eq!(
+            target_highlight_colors(&ui, &theme()),
+            vec![
+                ("A2".to_string(), target_color(0, &theme())),
+                ("B2".to_string(), target_color(2, &theme()))
+            ]
+        );
     }
 
     #[test]
     fn ordered_empty_once_every_target_is_matched() {
         let ui = ui_with(&["A2", "B2"], &[true, true], true);
-        assert!(active_target_names(&ui).is_empty());
+        assert!(target_highlight_colors(&ui, &theme()).is_empty());
     }
 
     #[test]
     fn unordered_empty_when_no_targets() {
         let ui = ui_with(&[], &[], false);
-        assert!(active_target_names(&ui).is_empty());
+        assert!(target_highlight_colors(&ui, &theme()).is_empty());
     }
 }
 
@@ -1327,7 +1410,7 @@ fn render_detected_indicator(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiStat
         .map(|t| t.elapsed() < Duration::from_millis(ui.cooldown_ms))
         .unwrap_or(false);
     let (text_style, border_style) = if cooldown_active {
-        let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200) % 2 == 0;
+        let blink_on = (ui.cooldown_started.unwrap().elapsed().as_millis() / 200).is_multiple_of(2);
         let s = if blink_on { success.add_modifier(Modifier::REVERSED) } else { success };
         (s, success)
     } else {
@@ -1404,15 +1487,21 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     }
 
     let name = ui.prompt_display.trim();
-    let caption = if ui.ordered {
+    let mistake_flash = ui.mistake_until.map_or(false, |t| std::time::Instant::now() < t) && ui.ordered;
+    let caption = if mistake_flash {
+        "MISTAKE — START OVER".to_string()
+    } else if ui.ordered {
         format!("{} OF {} MATCHED — IN ORDER", ui.matched, ui.targets.len())
     } else {
         format!("{} OF {} MATCHED", ui.matched, ui.targets.len())
     };
     // Heading: accent yellow — the first colored thing the eye lands on.
     let name_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
-    // Subheading: cyan by default, switching to green once progress starts.
-    let caption_style = if ui.matched > 0 {
+    // Subheading: red flash right after a hard-mode mistake, cyan by
+    // default, switching to green once progress starts.
+    let caption_style = if mistake_flash {
+        Style::default().fg(theme_color(&theme.danger, Color::Red)).add_modifier(Modifier::BOLD)
+    } else if ui.matched > 0 {
         Style::default().fg(theme_color(&theme.success, Color::Green)).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD)
@@ -1431,7 +1520,7 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     // its own per-character padding), same reasoning as the chip labels —
     // keeps more names qualifying for the bigger tier instead of falling
     // back.
-    let ascii_name = !name.is_empty() && name.chars().all(|c| c.is_ascii());
+    let ascii_name = !name.is_empty() && name.is_ascii();
     let name_chars = name.chars().count() as u16;
     let full_w = name_chars * HERO_GLYPH_COLS_PER_CHAR;
     let narrow_w = name_chars * HERO_GLYPH_COLS_PER_CHAR_NARROW;
@@ -1483,7 +1572,13 @@ fn render_heading_box(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
 /// fill the available column, so the three subsections — each its own
 /// clearly bounded "card" — always occupy the panel's real height with no
 /// unbounded space left over.
-fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, theme: &Theme) {
+fn render_hero_prompt(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    settings: &SettingsState,
+    theme: &Theme,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1528,7 +1623,7 @@ fn render_hero_prompt(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, them
     let notes_inner = notes_block.inner(notes_section);
     f.render_widget(notes_block, notes_section);
     let notes_h = HERO_CHIP_H.min(notes_inner.height);
-    render_targets_row(f, center_v(notes_inner, notes_h), ui, theme);
+    render_targets_row(f, center_v(notes_inner, notes_h), ui, theme, settings.fretboard_highlight);
 
     render_detected_indicator(f, detected_section, ui, theme);
 }
@@ -1612,11 +1707,12 @@ fn strip_octave(name: &str) -> &str {
 ///
 /// `settings.fretboard_highlight` selects the mode: off shows a plain
 /// static reference (every cell in `theme.secondary`); on colors/bolds the
-/// cells matching `active_target_names(ui)` (the current prompt's
-/// still-needed target notes) in `theme.accent`, clearing automatically as
-/// `ui` advances prompt to prompt. A one-line legend below the board (shown
+/// cells of every still-needed target note — each in its own sequence
+/// position color (`target_highlight_colors`), so ordered prompts show
+/// where the whole remaining run lives, clearing automatically as `ui`
+/// advances prompt to prompt. A one-line legend below the board (shown
 /// whenever there's vertical room to spare) explains the fret-marker dots
-/// and, in highlight mode, what the accent color means.
+/// and, in highlight mode, what the position colors mean.
 fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settings: &SettingsState, theme: &Theme) {
     let tuning = settings.resolved_tuning();
     let block = Block::default()
@@ -1713,12 +1809,21 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
     let open_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan)).add_modifier(Modifier::BOLD);
     let note_style = Style::default().fg(theme_color(&theme.secondary, Color::Cyan));
     let gutter_style = Style::default().fg(Color::DarkGray);
-    let highlight_style = Style::default().fg(theme_color(&theme.accent, Color::Yellow)).add_modifier(Modifier::BOLD);
-
     let active = if settings.fretboard_highlight {
-        active_target_names(ui)
+        target_highlight_colors(ui, theme)
     } else {
         Vec::new()
+    };
+    // Distinct colors still needed (used to decide between the single
+    // accent legend entry and per-position swatches).
+    let active_colors: Vec<Color> = {
+        let mut seen: Vec<Color> = Vec::new();
+        for (_, c) in &active {
+            if !seen.contains(c) {
+                seen.push(*c);
+            }
+        }
+        seen
     };
 
     let spaced = |s: &str| -> String { s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ") };
@@ -1744,7 +1849,11 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
             let gutter = centered_cell(format!("{fret}{marker}"), gutter_style);
             let string_cells = (0..6usize).map(|s| {
                 let name = tuning.string_note(s, fret).map(|n| n.name()).unwrap_or_else(|| "-".to_string());
-                let cell_style = if active.contains(&name.as_str()) { highlight_style } else { row_style };
+                let cell_style = active
+                    .iter()
+                    .find(|(n, _)| n == &name)
+                    .map(|(_, c)| Style::default().fg(*c).add_modifier(Modifier::BOLD))
+                    .unwrap_or(row_style);
                 centered_cell(label(&name), cell_style)
             });
             let bottom_margin = if gap_frets.contains(&fret) { 1 } else { 0 };
@@ -1753,7 +1862,7 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
         .collect();
 
     let widths: Vec<Constraint> = std::iter::once(Constraint::Length(tier.gutter_w))
-        .chain(std::iter::repeat(Constraint::Length(tier.string_col_w)).take(6))
+        .chain(std::iter::repeat_n(Constraint::Length(tier.string_col_w), 6))
         .collect();
     let table = Table::new(rows, widths).header(header).column_spacing(tier.spacing);
     f.render_widget(table, table_area);
@@ -1762,8 +1871,18 @@ fn render_fretboard(f: &mut ratatui::Frame<'_>, area: Rect, ui: &UiState, settin
         let mut spans = vec![Span::styled("●", gutter_style), Span::raw(" fret marker")];
         if settings.fretboard_highlight {
             spans.push(Span::raw("     "));
-            spans.push(Span::styled("●", highlight_style));
-            spans.push(Span::raw(" still-needed target"));
+            if active_colors.len() > 1 {
+                // One swatch per still-needed position color (capped),
+                // mirroring the chip underscores.
+                for c in active_colors.iter().take(6) {
+                    spans.push(Span::styled("●", Style::default().fg(*c).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::raw("= still-needed, in order (see chips)"));
+            } else if let Some((_, c)) = active.first() {
+                spans.push(Span::styled("●", Style::default().fg(*c).add_modifier(Modifier::BOLD)));
+                spans.push(Span::raw(" still-needed target"));
+            }
         }
         let legend = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
         f.render_widget(legend, legend_area);
@@ -1843,7 +1962,7 @@ fn draw_practice(
         (rows[0], rows[2], rows[3], SessionSlot::Panel(rows[4]))
     };
 
-    render_hero_prompt(f, hero_area, ui, theme);
+    render_hero_prompt(f, hero_area, ui, settings, theme);
 
     // Timer — full width. The Detected indicator now lives directly under
     // the target-note chips inside the hero panel (see
@@ -1868,8 +1987,18 @@ fn draw_practice(
         .gauge_style(Style::default().fg(gauge_color))
         .ratio(ui.time_left_frac)
         .label(Span::styled(
-            format!("{}s / {}s", ui.time_left_secs, ui.prompt_secs),
-            Style::default().add_modifier(Modifier::BOLD),
+            if settings.hard_sequence {
+                format!("{}s / {}s  [HARD]", ui.time_left_secs, ui.prompt_secs)
+            } else {
+                format!("{}s / {}s", ui.time_left_secs, ui.prompt_secs)
+            },
+            if settings.hard_sequence {
+                Style::default()
+                    .fg(theme_color(&theme.danger, Color::Red))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            },
         ));
     f.render_widget(gauge, timer_rows[1]);
 
@@ -1898,7 +2027,7 @@ fn draw_practice(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme_color(&theme.secondary, Color::Cyan)))
-                .title(" ←→ select, Enter to activate "),
+                .title(" ←→ select, Enter to activate · h = hard difficulty "),
         );
     f.render_widget(footer, action_area);
 
@@ -2002,18 +2131,22 @@ fn render_settings_help(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, setti
         4 => "When ON, each new prompt draws uniformly at random from the enabled categories \
               below, instead of cycling through them in order."
             .to_string(),
-        5..=11 => {
-            let (c, _) = &settings.enabled[app.settings_idx - 5];
+        5 => "When ON, ordered prompts (Scale/Mode/Progression/Lick/Piece) demand a perfect run: \
+              any newly-struck wrong note resets progress to the first note of the prompt. \
+              Press h during practice to flip it for the current session."
+            .to_string(),
+        6..=12 => {
+            let (c, _) = &settings.enabled[app.settings_idx - 6];
             category_help(*c).to_string()
         }
-        12 => format!(
+        13 => format!(
             "{} input device(s) found. Press Enter to rescan and choose one.",
             app.devices.len()
         ),
-        13 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
+        14 => "Optional folder of your own licks/pieces content, loaded alongside the built-in \
               library. Leave empty to use only the built-in content."
             .to_string(),
-        14 => "Save every change above and return to where you started.".to_string(),
+        15 => "Save every change above and return to where you started.".to_string(),
         _ => String::new(),
     };
     let block = Block::default()
@@ -2069,15 +2202,19 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
             if settings.fretboard_highlight { "ON" } else { "off" }
         ),
         4 => format!("Random mode: {}", if settings.random_mode { "ON" } else { "off" }),
-        5..=11 => {
-            let (c, on) = &settings.enabled[i - 5];
+        5 => format!(
+            "Hard difficulty (perfect sequence): {}",
+            if settings.hard_sequence { "ON" } else { "off" }
+        ),
+        6..=12 => {
+            let (c, on) = &settings.enabled[i - 6];
             format!("[{}] {}", if *on { "✓" } else { " " }, c.label())
         }
-        12 => format!(
+        13 => format!(
             "Audio device: {}",
             settings.audio_device.clone().unwrap_or_else(|| "(default mic)".to_string())
         ),
-        13 => {
+        14 => {
             if app.edit == Edit::Path {
                 format!("Custom content path: {}█", app.edit_buf)
             } else {
@@ -2089,7 +2226,7 @@ fn settings_row_label(i: usize, app: &App, settings: &SettingsState) -> String {
                 format!("Custom content path: {p}")
             }
         }
-        14 => "← Back (save & return)".to_string(),
+        15 => "← Back (save & return)".to_string(),
         _ => String::new(),
     }
 }

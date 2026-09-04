@@ -68,6 +68,10 @@ pub struct Config {
     /// static reference of every note. Defaults to off (static reference).
     #[serde(default)]
     pub fretboard_highlight: bool,
+    /// Hard difficulty: ordered prompts reset to the first note on any
+    /// newly-struck wrong note (see `engine::handle_pitch`). Defaults off.
+    #[serde(default)]
+    pub hard_sequence: bool,
     /// Optional path to a custom-content TOML file.
     #[serde(default)]
     pub custom_content_path: Option<PathBuf>,
@@ -96,6 +100,7 @@ impl Default for Config {
             tuning: crate::custom_tuning::ActiveTuning::default(),
             random_mode: false,
             fretboard_highlight: false,
+            hard_sequence: false,
             custom_content_path: None,
             custom_tuning_path: None,
             audio_device_name: None,

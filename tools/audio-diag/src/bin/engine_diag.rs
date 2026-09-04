@@ -26,6 +26,7 @@ impl EngineListener for PrintListener {
             EngineEvent::Cooldown { duration_ms } => format!("COOLDOWN: {}ms", duration_ms),
             EngineEvent::Timeout => "TIMEOUT".to_string(),
             EngineEvent::Score { passed, total } => format!("SCORE: {}/{}", passed, total),
+            EngineEvent::Mistake => "MISTAKE: progress reset to first note".to_string(),
         };
         println!("  {line}");
         self.log.lock().push(line);

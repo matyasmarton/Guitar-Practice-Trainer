@@ -18,7 +18,7 @@ use crate::music::{
 use crate::note::Note;
 use crate::pieces::midi_of;
 use crate::progressions::{degree_label, PROGRESSIONS};
-use crate::tuning::{Tuning, TuningId};
+use crate::tuning::Tuning;
 
 /// The seven prompt categories. The enabled-set is derived from this and the
 /// "Random" draw uniformly samples among enabled categories.
@@ -295,6 +295,7 @@ fn transpose_intervals(tuning: &Tuning, intervals: &[i8]) -> (u8, Vec<u8>) {
 mod tests {
     use super::*;
     use crate::note::{MIDI_MAX, MIDI_MIN};
+    use crate::tuning::TuningId;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 

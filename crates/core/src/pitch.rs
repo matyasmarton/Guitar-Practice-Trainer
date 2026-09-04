@@ -84,7 +84,7 @@ pub fn detect(frame: &[f32], sample_rate: u32) -> Option<f64> {
         if cmnd[tau] < YIN_THRESHOLD {
             // Local minimum: keep stepping while decreasing.
             let mut t = tau;
-            while t + 1 <= max_tau && cmnd[t + 1] < cmnd[t] {
+            while t < max_tau && cmnd[t + 1] < cmnd[t] {
                 t += 1;
             }
             tau_best = Some(t);
@@ -126,7 +126,7 @@ pub fn detect(frame: &[f32], sample_rate: u32) -> Option<f64> {
         return None;
     }
     let hz = sr / better_tau;
-    if hz < MIN_FREQ || hz > MAX_FREQ {
+    if !(MIN_FREQ..=MAX_FREQ).contains(&hz) {
         return None;
     }
     Some(hz)

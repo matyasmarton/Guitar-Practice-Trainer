@@ -67,6 +67,9 @@ pub enum EngineEvent {
     Timeout,
     /// Running score.
     Score { passed: u32, total: u32 },
+    /// Hard mode: the player struck a new wrong note; per-target progress
+    /// reset to the first note (prompt/timer/score unchanged).
+    Mistake,
 }
 
 /// Implement to receive engine events. Both the TUI and the Android Kotlin
@@ -113,6 +116,14 @@ struct EngineInner {
     /// While nonzero, `handle_pitch` ignores mic input and `handle_tick`
     /// decrements this instead of the countdown.
     cooldown_remaining: Duration,
+    /// Hard-mode run tracker: MIDI of the current unbroken voiced run;
+    /// `None` when silent (or the run just broke).
+    sustain_midi: Option<u8>,
+    /// Consecutive frames of `sustain_midi` (saturating at 255).
+    sustain_len: u8,
+    /// True if any frame of the current run had the note equal to the
+    /// then-required target.
+    sustain_was_legal: bool,
 }
 
 impl EngineInner {
@@ -203,6 +214,9 @@ impl Engine {
             score_passed: 0,
             score_total: 0,
             cooldown_remaining: Duration::ZERO,
+            sustain_midi: None,
+            sustain_len: 0,
+            sustain_was_legal: false,
         };
         // Pick an initial prompt so the engine always has a `current`.
         pick_new_prompt(&mut inner, &cats, &active_tuning);
@@ -413,7 +427,6 @@ fn run_driver(
 // ---------------------------------------------------------------------------
 // Core logic (pure, testable)
 // ---------------------------------------------------------------------------
-
 fn pick_new_prompt(inner: &mut EngineInner, cats: &[ChallengeType], tuning: &crate::tuning::Tuning) {
     if cats.is_empty() {
         return;
@@ -425,6 +438,9 @@ fn pick_new_prompt(inner: &mut EngineInner, cats: &[ChallengeType], tuning: &cra
     inner.next_idx = 0;
     inner.matched_count = 0;
     inner.stable_for_target = 0;
+    inner.sustain_midi = None;
+    inner.sustain_len = 0;
+    inner.sustain_was_legal = false;
     debug!(
         "new prompt: {:?} '{}' ({} targets, ordered={})",
         inner.current.kind,
@@ -454,10 +470,7 @@ fn handle_pitch(
     if inner.cooldown_remaining > Duration::ZERO {
         return;
     }
-    let midi = match hz.and_then(Note::from_hz) {
-        Some(n) => Some(n.midi()),
-        None => None,
-    };
+    let midi = hz.and_then(Note::from_hz).map(|n| n.midi());
     // Track the latest detected pitch for stable-note display + set matching.
     inner.last_detected_midi = midi;
     // Always emit the detected note so the UI can show what the mic hears,
@@ -470,11 +483,34 @@ fn handle_pitch(
             }
         }
     }
-    // Match logic: does the detected MIDI match the current required target?
+    // Hard-mode run tracking (also maintained when off — negligible cost).
     let required_midi: Option<u8> = required_target_midi(inner);
+    match midi {
+        Some(m) => {
+            if inner.sustain_midi == Some(m) {
+                inner.sustain_len = inner.sustain_len.saturating_add(1);
+            } else {
+                inner.sustain_midi = Some(m);
+                inner.sustain_len = 1;
+                inner.sustain_was_legal = m == required_midi.unwrap_or(u8::MAX);
+            }
+            if Some(m) == required_midi {
+                inner.sustain_was_legal = true;
+            }
+        }
+        None => {
+            inner.sustain_midi = None;
+            inner.sustain_len = 0;
+            inner.sustain_was_legal = false;
+        }
+    }
+    let mistake = inner.config.hard_sequence
+        && inner.current.ordered
+        && inner.sustain_len == 2
+        && !inner.sustain_was_legal;
     match (midi, required_midi) {
         (Some(m), Some(req)) if m == req => {
-            inner.stable_for_target = inner.stable_for_target.saturating_add(1).min(u8::MAX);
+            inner.stable_for_target = inner.stable_for_target.saturating_add(1);
 
             if inner.stable_for_target >= 2 {
                 // Accept the match.
@@ -485,8 +521,25 @@ fn handle_pitch(
         _ => {
             // Mismatch or no target: reset the stability counter.
             inner.stable_for_target = 0;
+            if mistake {
+                reset_for_mistake(inner, listener);
+            }
         }
     }
+}
+
+/// Hard mode: a newly-struck wrong note (2 stable frames, never legal during
+/// its run) resets per-target progress to the first note of the prompt.
+/// Prompt, timer, score, and the sustain tracker are untouched (keeping
+/// `sustain_len` running prevents re-triggering on the same sustained note).
+fn reset_for_mistake(inner: &mut EngineInner, listener: &Arc<dyn EngineListener>) {
+    for flag in &mut inner.matched {
+        *flag = false;
+    }
+    inner.next_idx = 0;
+    inner.matched_count = 0;
+    inner.stable_for_target = 0;
+    emit(listener, EngineEvent::Mistake);
 }
 
 fn required_target_midi(inner: &EngineInner) -> Option<u8> {
@@ -899,5 +952,200 @@ mod tests {
             .filter(|e| matches!(e, EngineEvent::Prompt(_)))
             .count();
         assert_eq!(prompt_count, 2, "expected a second Prompt after cooldown expiry: {got:?}");
+    }
+
+    // -- Hard difficulty (perfect sequence) --------------------------------
+
+    /// Re-pick prompts until the current Scale has at least `min` targets
+    /// (deterministic seed keeps this bounded).
+    fn ensure_scale_targets(eng: &Engine, min: usize) {
+        for _ in 0..50 {
+            let len = eng.inner.lock().current.targets.len();
+            if len >= min {
+                return;
+            }
+            let cats = eng.inner.lock().config.active_categories();
+            let mut g = eng.inner.lock();
+            let tuning = g.active_tuning.clone();
+            pick_new_prompt(&mut g, &cats, &tuning);
+        }
+        panic!("could not get a scale with {min} targets");
+    }
+
+    /// First candidate MIDI whose note name is not among the targets' names
+    /// (scans a wide chromatic spread; scales span several note names).
+    fn wrong_midi(targets: &[Note], offsets: &[i32]) -> u8 {
+        let names: Vec<String> = targets.iter().map(|t| t.name()).collect();
+        let base = targets[0].midi();
+        for &off in offsets {
+            let m = base as i32 + off;
+            if m < 0 {
+                continue;
+            }
+            let m = m as u8;
+            if let Some(n) = Note::from_midi(m) {
+                if !names.contains(&n.name()) {
+                    return m;
+                }
+            }
+        }
+        panic!("no wrong midi found among {offsets:?} (base {base})");
+    }
+
+    fn mistake_count(evs: &[EngineEvent]) -> usize {
+        evs.iter()
+            .filter(|e| matches!(e, EngineEvent::Mistake))
+            .count()
+    }
+
+    #[test]
+    fn hard_off_wrong_note_keeps_progress() {
+        let (rec, evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.enabled =
+            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        ensure_scale_targets(&eng, 3);
+
+        let targets = eng.inner.lock().current.targets.clone();
+        let wrong_hz = Note::from_midi(wrong_midi(
+            &targets,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -2, -3, -4, -5],
+        ))
+        .unwrap()
+        .hz();
+
+        // Match target 0.
+        eng.on_pitch(Some(targets[0].hz()));
+        eng.on_pitch(Some(targets[0].hz()));
+        // Stable wrong note (two frames) with hard mode OFF.
+        eng.on_pitch(Some(wrong_hz));
+        eng.on_pitch(Some(wrong_hz));
+
+        let got = collect(&evs);
+        assert_eq!(mistake_count(&got), 0, "no Mistake when hard mode off");
+        let g = eng.inner.lock();
+        assert_eq!(g.next_idx, 1, "progress kept");
+        assert_eq!(g.matched_count, 1, "progress kept");
+    }
+
+    #[test]
+    fn hard_on_jump_ahead_resets_to_first_note() {
+        let (rec, evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.enabled =
+            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.hard_sequence = true;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        ensure_scale_targets(&eng, 3);
+
+        let targets = eng.inner.lock().current.targets.clone();
+
+        // Match target 0, then jump ahead to target 2.
+        eng.on_pitch(Some(targets[0].hz()));
+        eng.on_pitch(Some(targets[0].hz()));
+        eng.on_pitch(Some(targets[2].hz()));
+        eng.on_pitch(Some(targets[2].hz()));
+
+        let got = collect(&evs);
+        assert_eq!(mistake_count(&got), 1, "exactly one Mistake: {got:?}");
+        {
+            let g = eng.inner.lock();
+            assert_eq!(g.next_idx, 0, "reset to first note");
+            assert_eq!(g.matched_count, 0, "reset to first note");
+            assert!(g.matched.iter().all(|m| !m), "all flags cleared");
+        }
+
+        // Sustaining the wrong note must not re-trigger.
+        eng.on_pitch(Some(targets[2].hz()));
+        eng.on_pitch(Some(targets[2].hz()));
+        let got = collect(&evs);
+        assert_eq!(mistake_count(&got), 1, "sustained wrong note fires once");
+    }
+
+    #[test]
+    fn hard_on_ring_out_after_match_is_not_mistake() {
+        let (rec, evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.enabled =
+            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.hard_sequence = true;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        ensure_scale_targets(&eng, 3);
+
+        let targets = eng.inner.lock().current.targets.clone();
+
+        // Match target 0, then let it ring out for 5 more frames.
+        eng.on_pitch(Some(targets[0].hz()));
+        eng.on_pitch(Some(targets[0].hz()));
+        for _ in 0..5 {
+            eng.on_pitch(Some(targets[0].hz()));
+        }
+        let got = collect(&evs);
+        assert_eq!(mistake_count(&got), 0, "ring-out is not a mistake");
+        assert_eq!(eng.inner.lock().next_idx, 1);
+
+        // Then play target 1 in order.
+        eng.on_pitch(Some(targets[1].hz()));
+        eng.on_pitch(Some(targets[1].hz()));
+        assert_eq!(eng.inner.lock().next_idx, 2, "clean transition accepted");
+    }
+
+    #[test]
+    fn hard_on_replay_after_silence_resets() {
+        let (rec, evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.enabled =
+            enumset::EnumSet::from(crate::config::EnabledCategory::Scale);
+        cfg.hard_sequence = true;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        ensure_scale_targets(&eng, 2);
+
+        let targets = eng.inner.lock().current.targets.clone();
+
+        // Match target 0, break to silence, then replay target 0.
+        eng.on_pitch(Some(targets[0].hz()));
+        eng.on_pitch(Some(targets[0].hz()));
+        eng.on_pitch(None);
+        eng.on_pitch(Some(targets[0].hz()));
+        eng.on_pitch(Some(targets[0].hz()));
+
+        let got = collect(&evs);
+        assert_eq!(mistake_count(&got), 1, "replay after silence is a mistake");
+        let g = eng.inner.lock();
+        assert_eq!(g.next_idx, 0, "reset to first note");
+        assert_eq!(g.matched_count, 0);
+    }
+
+    #[test]
+    fn hard_ignored_for_unordered() {
+        let (rec, evs) = Recorder::new();
+        let mut cfg = Config::default();
+        cfg.enabled = crate::config::EnabledCategory::Note.into();
+        cfg.hard_sequence = true;
+        let eng = make_engine(&rec, cfg);
+        emit_prompt_once(&eng);
+        assert!(!eng.inner.lock().current.ordered, "Note prompts unordered");
+
+        let targets = eng.inner.lock().current.targets.clone();
+        let wrong_hz = Note::from_midi(wrong_midi(
+            &targets,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, -1, -2, -3, -4, -5],
+        ))
+        .unwrap()
+        .hz();
+
+        eng.on_pitch(Some(wrong_hz));
+        eng.on_pitch(Some(wrong_hz));
+
+        let got = collect(&evs);
+        assert_eq!(mistake_count(&got), 0, "unordered never resets");
+        let g = eng.inner.lock();
+        assert_eq!(g.next_idx, 0);
+        assert_eq!(g.matched_count, 0);
     }
 }
