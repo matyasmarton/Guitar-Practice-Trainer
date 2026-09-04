@@ -14,8 +14,10 @@ use crate::note::{Note, MIDI_MAX};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TuningId {
     Standard,
+    #[default]
     AllFourths,
     DropDAllFourths,
 }
@@ -55,11 +57,6 @@ impl TuningId {
     }
 }
 
-impl Default for TuningId {
-    fn default() -> Self {
-        TuningId::AllFourths
-    }
-}
 
 /// A concrete set of six open-string MIDI notes plus a display label: what
 /// every fret-arithmetic/UI function actually needs, whether the tuning is

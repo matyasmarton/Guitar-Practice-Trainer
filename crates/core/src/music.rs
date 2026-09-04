@@ -246,7 +246,7 @@ pub fn fret_notes(tuning: &Tuning, root_midi: u8, intervals: &[i8]) -> Vec<u8> {
 /// Returns `None` if no string can voice `target` without exceeding
 /// `FRET_COUNT` (caller then raises an octave).
 fn best_string_midi(tuning: &Tuning, target: u8) -> Option<u8> {
-    if target < MIDI_MIN || target > MIDI_MAX {
+    if !(MIDI_MIN..=MIDI_MAX).contains(&target) {
         return None;
     }
     let mut best: Option<(u8, usize)> = None; // (fret, string)

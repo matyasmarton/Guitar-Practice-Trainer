@@ -28,6 +28,9 @@ pub struct FfiConfig {
     pub default_duration_sec: u32,
     pub enabled: Vec<String>,
     pub random_mode: bool,
+    /// Hard difficulty: ordered prompts reset to the first note on any
+    /// newly-struck wrong note. Defaults off.
+    pub hard_sequence: bool,
     pub custom_content_path: Option<String>,
     pub custom_tuning_path: Option<String>,
     pub audio_device_name: Option<String>,
@@ -78,6 +81,7 @@ impl From<&Config> for FfiConfig {
             default_duration_sec: c.default_duration_sec,
             enabled,
             random_mode: c.random_mode,
+            hard_sequence: c.hard_sequence,
             custom_content_path: c.custom_content_path.as_ref().map(|p| p.display().to_string()),
             custom_tuning_path: c.custom_tuning_path.as_ref().map(|p| p.display().to_string()),
             audio_device_name: c.audio_device_name.clone(),
@@ -127,6 +131,7 @@ impl FfiConfig {
             // Not currently exposed over the FFI surface (TUI-only setting;
             // Android has no fretboard visualizer to highlight).
             fretboard_highlight: false,
+            hard_sequence: self.hard_sequence,
         }
     }
 }
