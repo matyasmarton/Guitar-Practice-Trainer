@@ -1313,6 +1313,31 @@ fn render_targets_row(
         box_w.saturating_mul(n) + gap_w.saturating_mul(n.saturating_sub(1)) <= area.width
     };
     let fits_height = area.height >= HERO_GLYPH_ROWS + 2;
+    // Too short to draw even a 2-row chip box (top/bottom border) with a
+    // label row inside — degrade to one borderless text row so the notes
+    // stay readable instead of rendering empty boxes (seen at ~80×24,
+    // where the hero's three sections each shrink to ~4 rows).
+    if area.height < 3 {
+        let sep = if ui.ordered { " → " } else { "  ·  " };
+        let mut spans = Vec::new();
+        for (i, label) in compact_labels.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(sep));
+            }
+            let matched = ui.matched_indices.get(i).copied().unwrap_or(false);
+            spans.push(Span::styled(
+                label.clone(),
+                if matched { success } else { idle_text },
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
 
     let glyph_chars = max_chars(&glyph_labels);
     let full_box_w = glyph_chars * HERO_GLYPH_COLS_PER_CHAR + 6;
@@ -2081,7 +2106,15 @@ fn render_fretboard(
                 Constraint::Length(1),
             ])
             .split(centered);
-        (rows[0], Some(rows[2]))
+        // The legend spans the full panel inner width — slicing it to the
+        // table-width column clipped the text mid-word on narrow panels.
+        let legend = Rect {
+            x: inner.x,
+            y: rows[2].y,
+            width: inner.width,
+            height: rows[2].height,
+        };
+        (rows[0], Some(legend))
     } else {
         (centered, None)
     };
@@ -2189,7 +2222,7 @@ fn render_fretboard(
                     ));
                     spans.push(Span::raw(" "));
                 }
-                spans.push(Span::raw("= still-needed, in order (see chips)"));
+                spans.push(Span::raw("= still-needed"));
             } else if let Some((_, c)) = active.first() {
                 spans.push(Span::styled(
                     "●",
